@@ -1,0 +1,50 @@
+{
+  "name": "Church Ledger — Gestion Financière",
+  "short_name": "Church Ledger",
+  "description": "Gestion financière de l'église — Caisses, rapports, entrées et sorties.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#F4F6FA",
+  "theme_color": "#D97706",
+  "orientation": "any",
+  "lang": "fr",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' rx='40' fill='%23D97706'/><text x='96' y='130' font-size='100' text-anchor='middle'>✝️</text></svg>",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='100' fill='%23D97706'/><text x='256' y='340' font-size='260' text-anchor='middle'>✝️</text></svg>",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["finance", "productivity"],
+  "screenshots": [],
+  "shortcuts": [
+    {
+      "name": "Nouvelle Entrée",
+      "short_name": "Entrée",
+      "description": "Enregistrer une nouvelle entrée",
+      "url": "./index.html#entrees",
+      "icons": [{"src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><text y='80' font-size='80'>📥</text></svg>", "sizes": "96x96"}]
+    },
+    {
+      "name": "Nouvelle Sortie",
+      "short_name": "Sortie",
+      "description": "Enregistrer une nouvelle sortie",
+      "url": "./index.html#sorties",
+      "icons": [{"src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><text y='80' font-size='80'>📤</text></svg>", "sizes": "96x96"}]
+    },
+    {
+      "name": "Rapports",
+      "short_name": "Rapports",
+      "description": "Voir les rapports financiers",
+      "url": "./index.html#rapports",
+      "icons": [{"src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><text y='80' font-size='80'>📊</text></svg>", "sizes": "96x96"}]
+    }
+  ]
+}
