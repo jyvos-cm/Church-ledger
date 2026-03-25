@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Church Ledger — Guide d'installation PWA</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', Arial, sans-serif; background: #f8f7f4; color: #1a1810; padding: 20px; max-width: 680px; margin: 0 auto; }
+h1 { font-size: 22px; color: #b8941f; margin-bottom: 6px; letter-spacing: 2px; }
+.subtitle { font-size: 12px; color: #9a9080; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 30px; }
+.step { background: #fff; border: 1px solid #e0dbd0; border-radius: 12px; padding: 20px; margin-bottom: 16px; border-left: 4px solid #b8941f; }
+.step-num { font-size: 11px; font-weight: 700; color: #b8941f; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px; }
+.step h3 { font-size: 15px; font-weight: 700; margin-bottom: 8px; }
+.step p, .step li { font-size: 13px; color: #5a5240; line-height: 1.7; }
+.step ul { padding-left: 18px; margin-top: 6px; }
+.step code { background: #f2f0eb; border: 1px solid #e0dbd0; padding: 2px 7px; border-radius: 4px; font-family: monospace; font-size: 12px; color: #b8941f; }
+.alert { background: #e8f5ec; border: 1px solid rgba(26,122,58,.2); border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; font-size: 13px; color: #1a7a3a; }
+.warn { background: #fef9e7; border-color: rgba(138,96,0,.2); color: #8a6000; }
+.icon-preview { width: 80px; height: 80px; background: #b8941f; border-radius: 18px; display: flex; align-items: center; justify-content: center; font-size: 36px; margin: 0 auto 16px; }
+.center { text-align: center; }
+h2 { font-size: 16px; color: #b8941f; margin: 24px 0 12px; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+
+<div style="text-align:center; margin-bottom: 28px;">
+  <div class="icon-preview">✝</div>
+  <h1>✝ CHURCH LEDGER</h1>
+  <p class="subtitle">Guide d'Installation PWA — Fonctionne Hors Ligne</p>
+</div>
+
+<div class="alert">
+  ✅ <strong>Bonne nouvelle !</strong> Cette application fonctionne comme une vraie APK Android — elle s'installe sur votre écran d'accueil et fonctionne <strong>100% sans connexion internet</strong>.
+</div>
+
+<h2>📱 INSTALLATION SUR ANDROID</h2>
+
+<div class="step">
+  <div class="step-num">Étape 1</div>
+  <h3>Héberger les fichiers</h3>
+  <p>Copiez le dossier <code>church-ledger-pwa/</code> sur un hébergeur web. Options gratuites :</p>
+  <ul>
+    <li><strong>GitHub Pages</strong> — github.com → nouveau dépôt → activer Pages</li>
+    <li><strong>Netlify</strong> — netlify.com → glisser-déposer le dossier</li>
+    <li><strong>Vercel</strong> — vercel.com → importer le dossier</li>
+    <li><strong>Serveur local</strong> — ex: <code>python3 -m http.server 8080</code></li>
+  </ul>
+</div>
+
+<div class="step">
+  <div class="step-num">Étape 2</div>
+  <h3>Ouvrir dans Chrome Android</h3>
+  <p>Sur votre téléphone Android, ouvrez <strong>Google Chrome</strong> et accédez à l'URL de votre site.</p>
+  <ul>
+    <li>Chrome doit être utilisé (pas Firefox, pas Samsung Internet)</li>
+    <li>La première ouverture nécessite internet pour télécharger l'app</li>
+  </ul>
+</div>
+
+<div class="step">
+  <div class="step-num">Étape 3</div>
+  <h3>Installer sur l'écran d'accueil</h3>
+  <p>Une bannière dorée apparaîtra en bas : <strong>«Installer Church Ledger»</strong></p>
+  <ul>
+    <li>Appuyez sur <strong>«Installer»</strong></li>
+    <li>Ou : Menu Chrome (⋮) → <strong>«Ajouter à l'écran d'accueil»</strong></li>
+    <li>Confirmez l'installation</li>
+  </ul>
+</div>
+
+<div class="step">
+  <div class="step-num">Étape 4</div>
+  <h3>✅ Prêt ! Fonctionne hors ligne</h3>
+  <p>L'icône <strong>Church Ledger</strong> apparaît sur votre écran d'accueil. Appuyez dessus — l'app s'ouvre <strong>en plein écran</strong>, sans barre de navigation Chrome, comme une vraie application Android.</p>
+  <ul>
+    <li>✅ Toutes les données sont sauvegardées localement</li>
+    <li>✅ Fonctionne sans connexion internet</li>
+    <li>✅ Se lance instantanément</li>
+  </ul>
+</div>
+
+<h2>🍎 INSTALLATION SUR iPhone/iPad</h2>
+
+<div class="step">
+  <div class="step-num">Safari requis</div>
+  <h3>Utiliser Safari sur iOS</h3>
+  <ul>
+    <li>Ouvrir l'URL dans <strong>Safari</strong> (obligatoire sur iOS)</li>
+    <li>Appuyer sur l'icône <strong>Partager</strong> (carré avec flèche ↑)</li>
+    <li>Choisir <strong>«Sur l'écran d'accueil»</strong></li>
+    <li>Confirmer → l'icône Church Ledger apparaît</li>
+  </ul>
+</div>
+
+<h2>💻 UTILISATION SUR ORDINATEUR</h2>
+
+<div class="step">
+  <div class="step-num">Chrome / Edge</div>
+  <h3>Installation sur PC/Mac</h3>
+  <ul>
+    <li>Dans Chrome ou Edge, une icône d'installation (⊕) apparaît dans la barre d'adresse</li>
+    <li>Cliquez dessus → <strong>«Installer»</strong></li>
+    <li>L'app s'ouvre dans sa propre fenêtre sans navigateur</li>
+  </ul>
+</div>
+
+<div class="alert warn" style="margin-top: 24px;">
+  ⚠️ <strong>Important :</strong> Les données sont stockées localement sur chaque appareil (localStorage). Pour partager les données entre plusieurs appareils, il faudra ajouter une base de données en ligne.
+</div>
+
+<div style="margin-top: 28px; text-align: center; font-size: 11px; color: #9a9080; padding: 16px; border-top: 1px solid #e0dbd0;">
+  ✝ Church Ledger PWA — Gestion Financière<br>
+  Généré automatiquement — Fonctionne sur Android, iOS et PC
+</div>
+
+</body>
+</html>
