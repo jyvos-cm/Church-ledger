@@ -13,7 +13,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -24,30 +24,59 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Install Bubblewrap
-        run: npm install -g @bubblewrap/cli
+        run: npm install -g @bubblewrap/cli@latest
 
-      - name: Init Bubblewrap project
+      - name: Create twa-manifest.json
         run: |
-          mkdir apk-build && cd apk-build
-          bubblewrap init \
-            --manifest "https://jyvos-cm.github.io/Church-ledger/manifest.json" \
-            --directory .
-        env:
-          BUBBLEWRAP_SKIP_UPDATE_CHECK: true
+          mkdir -p apk-build
+          cat > apk-build/twa-manifest.json << 'EOF'
+          {
+            "packageId": "com.jyvos.churchledger",
+            "host": "jyvos-cm.github.io",
+            "name": "Church Ledger",
+            "launcherName": "Church Ledger",
+            "display": "standalone",
+            "themeColor": "#1a3a5c",
+            "navigationColor": "#1a3a5c",
+            "backgroundColor": "#ffffff",
+            "startUrl": "/Church-ledger/",
+            "iconUrl": "https://jyvos-cm.github.io/Church-ledger/icons/icon-512.png",
+            "maskableIconUrl": "https://jyvos-cm.github.io/Church-ledger/icons/icon-512.png",
+            "appVersion": "1.0.0",
+            "appVersionCode": 1,
+            "signingKey": {
+              "path": "../church-ledger.keystore",
+              "alias": "church-ledger"
+            },
+            "splashScreenFadeOutDuration": 300,
+            "enableNotifications": false,
+            "shortcuts": [],
+            "generatorApp": "bubblewrap-cli",
+            "webManifestUrl": "https://jyvos-cm.github.io/Church-ledger/manifest.json",
+            "fallbackType": "customtabs",
+            "features": {},
+            "alphaDependencies": {},
+            "enableSiteSettingsShortcut": true,
+            "isChromeOSOnly": false,
+            "isMetaQuest": false,
+            "fullScopeUrl": "https://jyvos-cm.github.io/Church-ledger/",
+            "minSdkVersion": 24,
+            "targetSdkVersion": 34,
+            "orientation": "default",
+            "fingerprints": [],
+            "additionalTrustedOrigins": [],
+            "retainedBundles": []
+          }
+          EOF
 
-      - name: Patch targetSdkVersion to 34
-        run: |
-          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/' apk-build/app/build.gradle
-          sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/' apk-build/app/build.gradle
-          sed -i 's/minSdkVersion [0-9]*/minSdkVersion 24/' apk-build/app/build.gradle
-          echo "=== build.gradle après patch ==="
-          grep -E "targetSdk|compileSdk|minSdk" apk-build/app/build.gradle
-
-      - name: Generate debug keystore
+      - name: Generate Keystore
         run: |
           keytool -genkey -v \
-            -keystore apk-build/church-ledger.keystore \
+            -keystore church-ledger.keystore \
             -alias church-ledger \
             -keyalg RSA -keysize 2048 \
             -validity 10000 \
@@ -55,16 +84,17 @@ jobs:
             -storepass churchledger2024 \
             -keypass churchledger2024
 
-      - name: Build APK
+      - name: Bubblewrap build
         run: |
           cd apk-build
           bubblewrap build \
-            --keystore church-ledger.keystore \
+            --keystore ../church-ledger.keystore \
             --keystorePassword churchledger2024 \
             --keyAlias church-ledger \
             --keyPassword churchledger2024
         env:
-          BUBBLEWRAP_SKIP_UPDATE_CHECK: true
+          BUBBLEWRAP_SKIP_UPDATE_CHECK: "true"
+          JAVA_HOME: ${{ env.JAVA_HOME }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
