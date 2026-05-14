@@ -1,0 +1,2537 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Church Ledger — Multi-Église</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#b8941f">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Church Ledger">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<script src="html2pdf.bundle.min.js"></script>
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import {
+    getFirestore, collection, doc, getDocs, addDoc, setDoc, deleteDoc,
+    onSnapshot, query, orderBy, serverTimestamp, writeBatch, getDoc
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  // ─── CONFIG FIREBASE ───────────────────────────────────────────────────────
+  const firebaseConfig = {
+    apiKey: "REPLACE_API_KEY",
+    authDomain: "REPLACE_PROJECT_ID.firebaseapp.com",
+    projectId: "REPLACE_PROJECT_ID",
+    storageBucket: "REPLACE_PROJECT_ID.appspot.com",
+    messagingSenderId: "REPLACE_SENDER_ID",
+    appId: "REPLACE_APP_ID"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+
+  // ─── CACHE LOCAL ────────────────────────────────────────────────────────────
+  const _cache = { members: [], entrees: [], sorties: [], notes: [], ready: false };
+  window._cache = _cache;
+  window._db = db;
+
+  // ─── HELPERS FIRESTORE GÉNÉRIQUES ─────────────────────────────────────────
+  window.fsGetAll = async function(col) {
+    try {
+      const snap = await getDocs(collection(db, col));
+      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch(e) { console.error('fsGetAll', col, e); return []; }
+  };
+
+  window.fsAdd = async function(col, data) {
+    try {
+      const ref = await addDoc(collection(db, col), { ...data, _ts: serverTimestamp() });
+      return ref.id;
+    } catch(e) { console.error('fsAdd', e); return null; }
+  };
+
+  window.fsSet = async function(col, id, data) {
+    try {
+      await setDoc(doc(db, col, id), { ...data, _ts: serverTimestamp() }, { merge: true });
+      return true;
+    } catch(e) { console.error('fsSet', e); return false; }
+  };
+
+  window.fsDel = async function(col, id) {
+    try {
+      await deleteDoc(doc(db, col, id));
+      return true;
+    } catch(e) { console.error('fsDel', e); return false; }
+  };
+
+  window.fsBatch = async function(ops) {
+    try {
+      const batch = writeBatch(db);
+      ops.forEach(op => {
+        const ref = op.id ? doc(db, op.col, op.id) : doc(collection(db, op.col));
+        if(op.type === 'del') batch.delete(ref);
+        else batch.set(ref, { ...op.data, _ts: serverTimestamp() }, { merge: true });
+      });
+      await batch.commit();
+      return true;
+    } catch(e) { console.error('fsBatch', e); return false; }
+  };
+
+  // ═══ INDEXEDDB — Stockage local persistant hors ligne ═════════════════════
+  const IDB_NAME = 'church-ledger-idb';
+  const IDB_VER  = 2;
+  let _idb = null;
+
+  function openIDB() {
+    if (_idb) return Promise.resolve(_idb);
+    return new Promise((res, rej) => {
+      const req = indexedDB.open(IDB_NAME, IDB_VER);
+      req.onupgradeneeded = e => {
+        const db2 = e.target.result;
+        ['members','entrees','sorties','notes','eglises','pendingSync'].forEach(store => {
+          if (!db2.objectStoreNames.contains(store))
+            db2.createObjectStore(store, { keyPath: 'id' });
+        });
+      };
+      req.onsuccess = e => { _idb = e.target.result; res(_idb); };
+      req.onerror   = e => { console.warn('IDB error:', e); rej(e); };
+    });
+  }
+
+  async function idbGetAll(store) {
+    try {
+      const db2 = await openIDB();
+      return new Promise((res, rej) => {
+        const tx  = db2.transaction(store, 'readonly');
+        const req = tx.objectStore(store).getAll();
+        req.onsuccess = () => res(req.result || []);
+        req.onerror   = () => res([]);
+      });
+    } catch(e) { return []; }
+  }
+
+  async function idbPut(store, item) {
+    try {
+      const db2 = await openIDB();
+      return new Promise((res) => {
+        const tx = db2.transaction(store, 'readwrite');
+        tx.objectStore(store).put(item);
+        tx.oncomplete = () => res(true);
+        tx.onerror    = () => res(false);
+      });
+    } catch(e) { return false; }
+  }
+
+  async function idbDel(store, id) {
+    try {
+      const db2 = await openIDB();
+      return new Promise((res) => {
+        const tx = db2.transaction(store, 'readwrite');
+        tx.objectStore(store).delete(id);
+        tx.oncomplete = () => res(true);
+        tx.onerror    = () => res(false);
+      });
+    } catch(e) { return false; }
+  }
+
+  async function idbPutAll(store, items) {
+    try {
+      const db2 = await openIDB();
+      return new Promise((res) => {
+        const tx = db2.transaction(store, 'readwrite');
+        const os = tx.objectStore(store);
+        items.forEach(item => os.put(item));
+        tx.oncomplete = () => res(true);
+        tx.onerror    = () => res(false);
+      });
+    } catch(e) { return false; }
+  }
+
+  async function idbClear(store) {
+    try {
+      const db2 = await openIDB();
+      return new Promise((res) => {
+        const tx = db2.transaction(store, 'readwrite');
+        tx.objectStore(store).clear();
+        tx.oncomplete = () => res(true);
+        tx.onerror    = () => res(false);
+      });
+    } catch(e) { return false; }
+  }
+
+  // File de synchronisation hors ligne
+  async function addPendingSync(op) {
+    await idbPut('pendingSync', { id: Date.now().toString(36) + Math.random().toString(36).slice(2), ...op });
+  }
+
+  async function flushPendingSync() {
+    if (!navigator.onLine) return;
+    const pending = await idbGetAll('pendingSync');
+    if (!pending.length) return;
+    const db2 = await openIDB();
+    for (const op of pending) {
+      try {
+        if (op.action === 'set')    await window.fsSet(op.col, op.id2, op.data);
+        if (op.action === 'del')    await window.fsDel(op.col, op.id2);
+        await idbDel('pendingSync', op.id);
+      } catch(e) { console.warn('Sync failed for', op, e); }
+    }
+    if (pending.length > 0) window._showSyncStatus('synced');
+  }
+
+  window._idbGetAll    = idbGetAll;
+  window._idbPut       = idbPut;
+  window._idbDel       = idbDel;
+  window._idbPutAll    = idbPutAll;
+  window._idbClear     = idbClear;
+  window._addPending   = addPendingSync;
+  window._flushPending = flushPendingSync;
+
+  // ─── MULTI-ÉGLISE : charger données (Firebase + fallback IDB) ──────────────
+  window.loadFirestoreData = async function(egliseId) {
+    const eid = egliseId || window._currentEgliseId;
+    if(!eid) { console.error('Pas d\'egliseId fourni'); return false; }
+
+    const colM  = `cl_members_${eid}`;
+    const colE  = `cl_entrees_${eid}`;
+    const colS  = `cl_sorties_${eid}`;
+    const colN  = `cl_notes_${eid}`;
+
+    window._activeCollections = { members: colM, entrees: colE, sorties: colS, notes: colN };
+
+    if (navigator.onLine) {
+      try {
+        await signInAnonymously(auth);
+        const [members, entrees, sorties, notes] = await Promise.all([
+          fsGetAll(colM), fsGetAll(colE), fsGetAll(colS), fsGetAll(colN),
+        ]);
+
+        // Premier lancement → créer admin par défaut
+        if (members.length === 0) {
+          const adminId = 'admin_default';
+          const admin = { id: adminId, nom: 'Administrateur', contact: '', role: 'admin', pin: '1234', statut: 'actif', caisses: window.CAISSES_IDS || [] };
+          await fsSet(colM, adminId, admin);
+          _cache.members = [admin];
+          await idbPut('members', { ...admin, _eid: eid });
+        } else {
+          _cache.members = members;
+          await idbPutAll('members', members.map(m => ({ ...m, _eid: eid })));
+        }
+        _cache.entrees = entrees; _cache.sorties = sorties; _cache.notes = notes;
+        await idbPutAll('entrees', entrees.map(e => ({ ...e, _eid: eid })));
+        await idbPutAll('sorties', sorties.map(s => ({ ...s, _eid: eid })));
+        await idbPutAll('notes',   notes.map(n  => ({ ...n, _eid: eid })));
+
+        // Sauvegarder info église localement
+        if (window._currentEglise) await idbPut('eglises', window._currentEglise);
+
+        _cache.ready = true;
+        await flushPendingSync();
+        window._showSyncStatus('online');
+        return true;
+      } catch(e) {
+        console.warn('Firebase indisponible, fallback IDB:', e);
+      }
+    }
+
+    // ─── FALLBACK HORS LIGNE : charger depuis IndexedDB ──────────────────────
+    try {
+      const [allM, allE, allS, allN] = await Promise.all([
+        idbGetAll('members'), idbGetAll('entrees'), idbGetAll('sorties'), idbGetAll('notes'),
+      ]);
+      _cache.members = allM.filter(m => m._eid === eid);
+      _cache.entrees = allE.filter(e => e._eid === eid);
+      _cache.sorties = allS.filter(s => s._eid === eid);
+      _cache.notes   = allN.filter(n => n._eid === eid);
+      _cache.ready   = true;
+      window._showSyncStatus('offline');
+      return true;
+    } catch(e) {
+      console.error('IDB fallback failed:', e);
+      return false;
+    }
+  };
+
+  /** Charger liste des églises — avec fallback IDB */
+  window.findEglises = async function() {
+    if (navigator.onLine) {
+      try {
+        const list = await fsGetAll('eglises');
+        await idbPutAll('eglises', list);
+        return list;
+      } catch(e) {}
+    }
+    return await idbGetAll('eglises');
+  };
+
+  window.getEglise = async function(egliseId) {
+    if (navigator.onLine) {
+      try {
+        const snap = await getDoc(doc(db, 'eglises', egliseId));
+        if (snap.exists()) {
+          const data = { id: snap.id, ...snap.data() };
+          await idbPut('eglises', data);
+          return data;
+        }
+        return null;
+      } catch(e) {}
+    }
+    // Fallback IDB
+    const all = await idbGetAll('eglises');
+    return all.find(e => e.id === egliseId) || null;
+  };
+
+  // ─── FONCTIONS INSCRIPTION / VALIDATION JYVOS ─────────────────────────────
+
+  /** Soumettre inscription église → statut en_attente */
+  window.inscrireEglise = async function(data) {
+    const egliseId = 'eglise_' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+    const eglise = {
+      id: egliseId,
+      nom: data.nom,
+      pasteur: data.pasteur,
+      ville: data.ville,
+      email: data.email || '',
+      contact: data.contact || '',
+      statut: 'en_attente',
+      dateInscription: new Date().toISOString()
+    };
+    const ok = await fsSet('eglises', egliseId, eglise);
+    if (ok) await idbPut('eglises', eglise);
+    return ok ? eglise : null;
+  };
+
+  /** Charger liste des églises — pour JYVOS admin */
+  window.loadEglises = async function() {
+    return await fsGetAll('eglises');
+  };
+
+  /** Valider une église (JYVOS) */
+  window.validerEglise = async function(egliseId) {
+    return await fsSet('eglises', egliseId, { statut: 'actif' });
+  };
+
+  /** Suspendre une église (JYVOS) */
+  window.suspendreEglise = async function(egliseId) {
+    return await fsSet('eglises', egliseId, { statut: 'suspendu' });
+  };
+</script>
+
+<style>
+:root{
+  --bg:#f8f7f4;--bg2:#ffffff;--bg3:#f2f0eb;--bg4:#ebe8e0;
+  --gold:#b8941f;--gold2:#d4aa30;--gold3:rgba(184,148,31,0.12);
+  --border:#e0dbd0;--border2:#c8a951;
+  --text:#1a1810;--text2:#5a5240;--text3:#9a9080;
+  --green:#1a7a3a;--green2:#e8f5ec;
+  --red:#c0392b;--red2:#fde8e6;
+  --blue:#1a5276;--blue2:#e8f0f8;
+  --amber:#8a6000;--amber2:#fef9e7;
+  --purple:#6c3483;--purple2:#f4ecf7;
+  --r:8px;--r2:14px;--sh:0 2px 12px rgba(0,0,0,0.08);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;font-family:'Barlow','Segoe UI','Helvetica Neue',Arial,sans-serif;background:var(--bg);color:var(--text);overflow:hidden}
+@media(min-width:1024px){
+  #nav{padding:0 28px}
+  #main{padding:28px 36px 48px;max-width:1600px;margin:0 auto}
+  .sgrid{grid-template-columns:repeat(6,1fr)}
+  .fgrid{grid-template-columns:repeat(3,1fr)}
+  .caisses-grid{grid-template-columns:repeat(4,1fr)}
+  .mbox{max-width:680px}
+}
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:var(--bg3)}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+input,select,textarea,button{font-family:'Barlow','Segoe UI','Helvetica Neue',Arial,sans-serif}
+
+/* BANNIÈRE HORS LIGNE */
+#offlineBanner{display:none;position:fixed;top:0;left:0;right:0;z-index:99990;padding:8px 16px;font-size:12px;font-weight:700;text-align:center;letter-spacing:1px;transition:all .3s}
+#offlineBanner.offline{display:block;background:#c0392b;color:#fff}
+#offlineBanner.syncing{display:block;background:var(--amber);color:#fff}
+#offlineBanner.synced{display:block;background:var(--green);color:#fff;animation:fadeOutBanner 2.5s forwards}
+@keyframes fadeOutBanner{0%{opacity:1}70%{opacity:1}100%{opacity:0;display:none}}
+
+/* ═══ ÉCRANS D'ACCUEIL MULTI-ÉTAPES ═══════════════════════════════════════ */
+#welcomeScreen{position:fixed;inset:0;display:flex;align-items:flex-start;justify-content:center;z-index:9000;background:linear-gradient(135deg,#f8f7f4 0%,#ede8dc 100%);overflow-y:auto;padding:20px 0 40px}
+.wbox{width:420px;max-width:96vw;padding:48px 40px;background:#fff;border:1px solid var(--border);border-radius:20px;box-shadow:0 8px 40px rgba(0,0,0,0.1);animation:fadeUp .4s ease}
+.wbox .wicon{text-align:center;font-size:52px;margin-bottom:8px}
+.wbox h1{font-family:'Cinzel','Georgia',serif;font-size:20px;color:var(--gold);text-align:center;letter-spacing:4px;font-weight:700}
+.wbox .wsub{text-align:center;font-size:10px;color:var(--text3);letter-spacing:4px;text-transform:uppercase;margin-bottom:32px;margin-top:4px}
+.wstep{display:none}.wstep.on{display:block}
+.wbtn-group{display:flex;gap:10px;margin-top:24px}
+.wbtn{flex:1;padding:14px;border:none;border-radius:var(--r);font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase;cursor:pointer;transition:all .2s}
+.wbtn.pri{background:var(--gold);color:#fff}.wbtn.pri:hover{background:var(--gold2)}
+.wbtn.sec{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}.wbtn.sec:hover{border-color:var(--gold);color:var(--gold)}
+.wbtn.dan{background:var(--red);color:#fff}.wbtn.dan:hover{opacity:.85}
+.wlbl{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:2px;margin-bottom:7px;display:block;font-weight:600}
+.wbox select,.wbox input,.wbox textarea{width:100%;padding:11px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:14px;outline:none;transition:border-color .2s;margin-bottom:14px}
+.wbox select:focus,.wbox input:focus,.wbox textarea:focus{border-color:var(--gold2)}
+.wbox textarea{resize:vertical;min-height:70px}
+.werr{color:var(--red);font-size:12px;text-align:center;margin-top:8px;min-height:18px}
+.winfo{color:var(--blue);font-size:12px;text-align:center;margin-top:8px}
+.wok{color:var(--green);font-size:13px;text-align:center;margin-top:10px;font-weight:700}
+.pinwrap{margin-bottom:16px}.pinwrap input{text-align:center;letter-spacing:10px;font-size:22px;color:var(--gold);font-weight:700;margin-bottom:0!important}
+.wback{background:none;border:none;color:var(--text3);font-size:12px;cursor:pointer;padding:4px 0;display:flex;align-items:center;gap:6px;margin-bottom:16px;letter-spacing:.5px}
+.wback:hover{color:var(--gold)}
+.eglise-select-item{display:flex;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--border);border-radius:var(--r);cursor:pointer;transition:all .2s;margin-bottom:8px;background:#fff}
+.eglise-select-item:hover{border-color:var(--gold);background:var(--gold3)}
+.eglise-select-item .esi-nom{font-weight:700;font-size:14px;color:var(--text)}
+.eglise-select-item .esi-ville{font-size:11px;color:var(--text3);margin-top:2px}
+.eglise-select-item .esi-badge{margin-left:auto;font-size:10px;padding:3px 8px;border-radius:10px;font-weight:700;letter-spacing:.5px}
+.badge-attente{background:var(--amber2);color:var(--amber);border:1px solid rgba(138,96,0,.2)}
+.badge-actif{background:var(--green2);color:var(--green);border:1px solid rgba(26,122,58,.2)}
+.badge-suspendu{background:var(--red2);color:var(--red);border:1px solid rgba(192,57,43,.2)}
+.eglise-scroll{max-height:280px;overflow-y:auto;margin-bottom:14px}
+.wdivider{display:flex;align-items:center;gap:10px;margin:18px 0;color:var(--text3);font-size:11px}
+.wdivider::before,.wdivider::after{content:'';flex:1;height:1px;background:var(--border)}
+
+/* LOGIN APP (après sélection église) */
+#loginScreen{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:8900;background:linear-gradient(135deg,#f8f7f4 0%,#ede8dc 100%)}
+.lbox{width:360px;padding:48px 40px;background:#fff;border:1px solid var(--border);border-radius:20px;box-shadow:0 8px 40px rgba(0,0,0,0.1);animation:fadeUp .4s ease}
+.lbox .licon{text-align:center;font-size:44px;margin-bottom:8px}
+.lbox h1{font-family:'Cinzel','Georgia',serif;font-size:20px;color:var(--gold);text-align:center;letter-spacing:4px;font-weight:700}
+.lbox .lsub{text-align:center;font-size:10px;color:var(--text3);letter-spacing:4px;text-transform:uppercase;margin-bottom:8px;margin-top:4px}
+.lbox .leglise-name{text-align:center;font-size:13px;font-weight:700;color:var(--text);margin-bottom:24px;padding:8px 14px;background:var(--gold3);border-radius:8px;border:1px solid var(--border2)}
+.lbl{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:2px;margin-bottom:7px;display:block;font-weight:600}
+.lbox select,.lbox input{width:100%;padding:11px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:14px;outline:none;transition:border-color .2s;margin-bottom:18px}
+.lbox select:focus,.lbox input:focus{border-color:var(--gold2)}
+.pinwrap2{margin-bottom:26px}.pinwrap2 input{text-align:center;letter-spacing:10px;font-size:22px;color:var(--gold);font-weight:700;margin-bottom:0!important}
+.lbtn{width:100%;padding:13px;background:var(--gold);color:#fff;border:none;border-radius:var(--r);font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase;transition:all .2s;cursor:pointer}
+.lbtn:hover{background:var(--gold2)}
+.lerr{color:var(--red);font-size:12px;text-align:center;margin-top:12px;min-height:18px}
+.lchange-eglise{display:block;text-align:center;margin-top:14px;font-size:11px;color:var(--text3);cursor:pointer;background:none;border:none;letter-spacing:.5px}
+.lchange-eglise:hover{color:var(--gold)}
+
+/* ═══ APP ═══════════════════════════════════════════════════════════════════ */
+#app{display:none;height:100vh;flex-direction:column}
+#app.on{display:flex}
+#topbar{display:flex;align-items:center;padding:0 20px;height:54px;background:#fff;border-bottom:2px solid var(--border2);flex-shrink:0;gap:12px;box-shadow:var(--sh)}
+.tlogo{font-family:'Cinzel','Georgia',serif;font-size:15px;color:var(--gold);letter-spacing:3px;font-weight:700;margin-right:auto;display:flex;align-items:center;gap:10px}
+.tlogo small{display:block;font-size:9px;color:var(--text3);letter-spacing:3px;font-family:'Barlow','Segoe UI','Helvetica Neue',Arial,sans-serif;text-transform:uppercase;margin-top:1px;font-weight:400}
+.tlogo .teglise{display:block;font-size:10px;color:var(--gold2);letter-spacing:1.5px;font-family:'Barlow','Segoe UI','Helvetica Neue',Arial,sans-serif;font-weight:600;margin-top:1px}
+.tavatar{width:32px;height:32px;border-radius:50%;background:var(--gold3);border:2px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:var(--gold);flex-shrink:0}
+.tname{font-size:13px;font-weight:600;color:var(--text)}
+.trole{font-size:9px;padding:3px 9px;border-radius:20px;background:var(--gold3);color:var(--gold);font-weight:700;letter-spacing:1px;border:1px solid var(--border2)}
+.tconnect{display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.5px;border:1px solid;transition:all .4s}
+.tconnect.online{background:#e8f5ec;border-color:rgba(26,122,58,.25);color:var(--green)}
+.tconnect.offline{background:var(--red2);border-color:rgba(192,57,43,.2);color:var(--red)}
+.tconnect .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.tconnect.online .dot{background:var(--green);box-shadow:0 0 0 0 rgba(26,122,58,.4);animation:pulse-green 2s infinite}
+.tconnect.offline .dot{background:var(--red)}
+@keyframes pulse-green{0%{box-shadow:0 0 0 0 rgba(26,122,58,.4)}70%{box-shadow:0 0 0 6px rgba(26,122,58,0)}100%{box-shadow:0 0 0 0 rgba(26,122,58,0)}}
+.tlogout{background:none;border:1px solid var(--border);border-radius:6px;color:var(--text3);font-size:11px;padding:5px 12px;cursor:pointer;transition:all .2s;margin-left:4px;font-weight:600}
+.tlogout:hover{border-color:var(--red);color:var(--red)}
+
+/* NAV */
+#nav{display:flex;background:#fff;border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto;padding:0 16px}
+#nav::-webkit-scrollbar{height:0}
+.nbtn{display:flex;align-items:center;gap:6px;padding:0 14px;height:44px;border:none;background:none;color:var(--text3);font-size:11px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;white-space:nowrap;border-bottom:3px solid transparent;transition:all .2s;cursor:pointer}
+.nbtn:hover{color:var(--text2)}.nbtn.on{color:var(--gold);border-bottom-color:var(--gold)}
+
+/* MAIN */
+#main{flex:1;overflow-y:auto;padding:24px 22px 40px;background:var(--bg)}
+.sec{display:none;animation:fadeIn .2s ease}.sec.on{display:block}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+.ph{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:22px;flex-wrap:wrap;gap:12px}
+.ph h2{font-family:'Cinzel','Georgia',serif;font-size:18px;color:var(--gold);font-weight:700;letter-spacing:2px}
+.ph small{display:block;font-size:12px;color:var(--text3);margin-top:3px}
+.card{background:#fff;border:1px solid var(--border);border-radius:var(--r2);padding:20px;box-shadow:var(--sh)}
+
+/* STATS */
+.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.scard{background:#fff;border:1px solid var(--border);border-radius:var(--r2);padding:16px 18px;position:relative;overflow:hidden;box-shadow:var(--sh)}
+.scard::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.scard.green::before{background:var(--green)}.scard.red::before{background:var(--red)}.scard.gold::before{background:var(--gold)}.scard.blue::before{background:var(--blue)}
+.scard .sl{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:2px;margin-bottom:7px;font-weight:600}
+.scard .sv{font-size:21px;font-weight:700;font-family:'Barlow Condensed','Arial Narrow','Segoe UI',Arial,sans-serif}
+.sv.g{color:var(--green)}.sv.r{color:var(--red)}.sv.gold{color:var(--gold)}.sv.b{color:var(--blue)}
+.scard .si{position:absolute;right:14px;top:50%;transform:translateY(-50%);font-size:26px;opacity:.1}
+
+/* CAISSES */
+.caisses-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+.caisse-card{background:#fff;border:1px solid var(--border);border-radius:var(--r2);padding:20px;cursor:pointer;transition:all .2s;box-shadow:var(--sh);border-left:4px solid var(--border2)}
+.caisse-card:hover{border-left-color:var(--gold);box-shadow:0 4px 20px rgba(0,0,0,0.12);transform:translateY(-2px)}
+.cc-head{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.cc-icon{font-size:28px}.cc-nom{font-family:'Cinzel','Georgia',serif;font-size:13px;color:var(--gold);letter-spacing:1px;font-weight:700}
+.cc-badge{font-size:9px;color:var(--text3);margin-top:2px}
+.cc-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px}
+.cc-stat{background:var(--bg3);border-radius:6px;padding:8px 10px;text-align:center}
+.cc-stat .csl{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px;font-weight:600}
+.cc-stat .csv{font-family:'Barlow Condensed','Arial Narrow','Segoe UI',Arial,sans-serif;font-size:15px;font-weight:700}
+.cc-foot{font-size:11px;color:var(--text3);display:flex;gap:14px;flex-wrap:wrap}
+.cc-hint{font-size:10px;color:var(--gold);margin-top:10px;text-align:right;font-style:italic}
+
+/* BACK BTN */
+.back-btn{display:inline-flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text2);font-size:12px;cursor:pointer;padding:7px 14px;margin-bottom:18px;transition:all .2s;font-family:'Barlow','Segoe UI','Helvetica Neue',Arial,sans-serif;font-weight:600;text-transform:uppercase;letter-spacing:1px}
+.back-btn:hover{border-color:var(--gold);color:var(--gold)}
+
+/* TABLE */
+.twrap{overflow-x:auto;border-radius:var(--r);border:1px solid var(--border);box-shadow:var(--sh)}
+table{width:100%;border-collapse:collapse;font-size:13px;background:#fff}
+thead tr{background:var(--bg4)}
+thead th{padding:10px 13px;text-align:left;font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1.5px;font-weight:700;white-space:nowrap;border-bottom:1px solid var(--border)}
+tbody tr{border-top:1px solid var(--bg3);transition:background .12s}
+tbody tr:hover{background:var(--bg3)}
+td{padding:10px 13px;vertical-align:middle}
+.tamt{font-family:'Barlow Condensed','Arial Narrow','Segoe UI',Arial,sans-serif;font-size:15px;font-weight:700}
+
+/* FORM */
+.fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px 16px;margin-bottom:10px}
+.fg label{font-size:11px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;display:block}
+.fg input,.fg select,.fg textarea{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:var(--r);font-size:13px;background:var(--bg3);color:var(--text);outline:none;transition:border-color .2s}
+.fg input:focus,.fg select:focus,.fg textarea:focus{border-color:var(--gold2)}
+.fg textarea{resize:vertical;min-height:60px}
+.req{color:var(--red)}
+.factions{display:flex;gap:10px;justify-content:flex-end;padding-top:14px;margin-top:4px;border-top:1px solid var(--bg4)}
+.btn{padding:9px 20px;border-radius:var(--r);font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;cursor:pointer;transition:all .2s;border:1px solid;display:inline-flex;align-items:center;gap:6px}
+.btn.pri{background:var(--gold);color:#fff;border-color:var(--gold)}.btn.pri:hover{background:var(--gold2)}
+.btn.sec{background:#fff;color:var(--text2);border-color:var(--border)}.btn.sec:hover{border-color:var(--gold);color:var(--gold)}
+.btn.dan{background:var(--red);color:#fff;border-color:var(--red)}.btn.dan:hover{opacity:.85}
+.btn.sm{padding:6px 14px;font-size:11px}
+
+/* MODAL */
+.mover{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:8800;align-items:center;justify-content:center;padding:16px;overflow-y:auto}
+.mover.on{display:flex}
+.mbox{background:#fff;border-radius:var(--r2);width:100%;max-width:560px;max-height:92vh;overflow-y:auto;padding:28px;box-shadow:0 16px 60px rgba(0,0,0,0.2);animation:fadeUp .25s ease}
+.mhdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;padding-bottom:14px;border-bottom:2px solid var(--border2)}
+.mhdr h3{font-family:'Cinzel','Georgia',serif;font-size:14px;color:var(--gold);letter-spacing:2px;font-weight:700}
+.mclose{background:none;border:none;color:var(--text3);font-size:18px;cursor:pointer;line-height:1;transition:color .15s}.mclose:hover{color:var(--red)}
+
+/* ALERT */
+.al{padding:10px 14px;border-radius:var(--r);font-size:12px;font-weight:600;margin-bottom:12px}
+.al.err{background:var(--red2);color:var(--red);border:1px solid rgba(192,57,43,.2)}
+.al.ok{background:var(--green2);color:var(--green);border:1px solid rgba(26,122,58,.2)}
+.al.warn{background:var(--amber2);color:var(--amber);border:1px solid rgba(138,96,0,.2)}
+.al.info{background:var(--blue2);color:var(--blue);border:1px solid rgba(26,82,118,.2)}
+
+/* BADGES */
+.bdg{display:inline-flex;align-items:center;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:.5px}
+.bdg.g{background:var(--green2);color:var(--green)}.bdg.r{background:var(--red2);color:var(--red)}.bdg.gold{background:var(--gold3);color:var(--gold)}.bdg.am{background:var(--amber2);color:var(--amber)}.bdg.b{background:var(--blue2);color:var(--blue)}
+
+/* FILTER */
+.filt{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+.filt select,.filt input{padding:8px 12px;border:1px solid var(--border);border-radius:var(--r);font-size:12px;background:#fff;color:var(--text);outline:none}
+.filt select:focus,.filt input:focus{border-color:var(--gold2)}
+
+/* MEMBERS */
+.mrow{display:grid;grid-template-columns:auto 1fr auto auto;align-items:center;gap:12px;padding:12px 16px;background:#fff;border:1px solid var(--border);border-radius:var(--r);margin-bottom:8px;box-shadow:var(--sh)}
+.mavt{width:38px;height:38px;border-radius:50%;background:var(--gold3);border:2px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;color:var(--gold);flex-shrink:0}
+
+/* NOTES */
+.ncard{background:#fff;border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;margin-bottom:8px;box-shadow:var(--sh)}
+
+/* BENEFICIAIRES */
+.bcard{background:#fff;border:1px solid var(--border);border-radius:var(--r2);padding:16px;margin-bottom:12px;box-shadow:var(--sh)}
+.bname{font-weight:700;font-size:14px;color:var(--text);margin-bottom:8px}
+.bstats{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:10px;font-size:12px;color:var(--text2)}
+.bst{background:var(--bg3);padding:5px 10px;border-radius:6px}
+.bline{display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px solid var(--bg3);flex-wrap:wrap;font-size:12px}
+.bdate{font-weight:600;color:var(--text);min-width:75px}
+.bamt{font-family:'Barlow Condensed','Arial Narrow','Segoe UI',Arial,sans-serif;font-size:14px;font-weight:700;color:var(--red);min-width:90px}
+.bcaisse{font-size:10px;color:var(--text3)}
+.bmotif{color:var(--text2);flex:1}
+
+/* CHART */
+.chwrap{height:170px;margin-bottom:6px}
+
+/* TOAST */
+#toast{position:fixed;bottom:28px;right:28px;z-index:9999;padding:12px 20px;border-radius:var(--r);font-size:13px;font-weight:600;opacity:0;transform:translateY(8px);transition:all .28s;pointer-events:none;box-shadow:0 4px 20px rgba(0,0,0,0.2)}
+#toast.on{opacity:1;transform:none}
+#toast.ok{background:var(--green);color:#fff}#toast.err{background:var(--red);color:#fff}#toast.warn{background:var(--amber);color:#fff}
+.empty{text-align:center;padding:44px 20px;color:var(--text3)}.empty .ei{font-size:36px;margin-bottom:12px}.empty p{font-size:13px}
+
+/* RAPPORT */
+.rp-caisses-table{width:100%;border-collapse:collapse;font-size:12px}
+.rp-caisses-table th,.rp-caisses-table td{padding:9px 12px;border:1px solid var(--border);text-align:center}
+.rp-caisses-table thead tr{background:var(--bg4)}
+.rp-caisses-table th{font-size:9px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:1px}
+.row-hdr{font-size:9px!important;font-weight:700!important;color:var(--text3)!important;text-transform:uppercase!important;letter-spacing:1px!important;background:var(--bg4)!important;text-align:left!important;white-space:nowrap}
+.row-lbl{text-align:left!important;font-weight:600;color:var(--text2);white-space:nowrap;font-size:12px}
+.rp-caisses-wrap{overflow-x:auto;border:1px solid var(--border2);border-radius:0 0 var(--r) var(--r)}
+.rp-table,.rp-benef-table{width:100%;border-collapse:collapse;font-size:12px}
+.rp-table th,.rp-benef-table th{padding:9px 12px;background:var(--bg4);font-size:9px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:1px;border:1px solid var(--border)}
+.rp-table td,.rp-benef-table td{padding:9px 12px;border:1px solid var(--border);font-size:12px}
+.rp-twrap,.rp-benef-wrap{overflow-x:auto;border-radius:var(--r);border:1px solid var(--border)}
+.rp-titre{font-family:'Cinzel','Georgia',serif;font-size:18px;color:var(--gold);text-align:center;letter-spacing:3px;font-weight:700;padding:18px;background:var(--bg4);border:2px solid var(--border2);border-radius:var(--r) var(--r) 0 0;margin-bottom:0}
+.rp-sub{font-size:11px;color:var(--text3);text-align:center;margin:8px 0 20px;letter-spacing:1px}
+.rp-total{background:var(--bg4);font-weight:700}
+.rp-solde{background:var(--gold3);font-weight:700;font-size:14px}
+.rp-vide td{background:var(--bg)!important}
+
+/* JYVOS ADMIN */
+#jyvosPanel{position:fixed;inset:0;background:linear-gradient(135deg,#1a1810 0%,#2c2410 100%);z-index:10000;display:none;flex-direction:column;color:#f5f0e0;overflow-y:auto}
+#jyvosPanel.on{display:flex}
+.jy-header{background:rgba(184,148,31,.15);border-bottom:2px solid rgba(184,148,31,.4);padding:20px 32px;display:flex;align-items:center;gap:16px}
+.jy-logo{font-family:'Cinzel','Georgia',serif;font-size:22px;color:var(--gold);letter-spacing:4px;font-weight:700}
+.jy-logo small{display:block;font-size:9px;color:rgba(184,148,31,.7);letter-spacing:3px;font-weight:400;font-family:'Barlow','Segoe UI',Arial,sans-serif}
+.jy-body{padding:32px;flex:1}
+.jy-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:32px}
+.jy-stat{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:var(--r2);padding:20px;border-left:4px solid var(--gold)}
+.jy-stat .js-label{font-size:10px;color:rgba(255,255,255,.5);text-transform:uppercase;letter-spacing:2px;margin-bottom:8px;font-weight:600}
+.jy-stat .js-val{font-family:'Barlow Condensed','Arial Narrow','Segoe UI',Arial,sans-serif;font-size:28px;font-weight:700;color:var(--gold)}
+.jy-table{width:100%;border-collapse:collapse;font-size:13px}
+.jy-table th{padding:11px 14px;font-size:10px;color:rgba(255,255,255,.5);text-transform:uppercase;letter-spacing:1.5px;font-weight:700;border-bottom:1px solid rgba(255,255,255,.1);text-align:left}
+.jy-table td{padding:13px 14px;border-bottom:1px solid rgba(255,255,255,.06);color:#f5f0e0}
+.jy-table tbody tr:hover{background:rgba(255,255,255,.04)}
+.jy-btn{padding:7px 16px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:1px;cursor:pointer;border:none;transition:all .2s}
+.jy-btn.activer{background:var(--green);color:#fff}.jy-btn.activer:hover{opacity:.85}
+.jy-btn.suspendre{background:rgba(192,57,43,.8);color:#fff}.jy-btn.suspendre:hover{opacity:.85}
+.jy-btn.voir{background:rgba(255,255,255,.1);color:#f5f0e0;border:1px solid rgba(255,255,255,.2)}.jy-btn.voir:hover{background:rgba(255,255,255,.2)}
+.jy-section-title{font-family:'Cinzel','Georgia',serif;font-size:14px;color:var(--gold);letter-spacing:3px;font-weight:700;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid rgba(184,148,31,.3)}
+.jy-actions{margin-left:auto;display:flex;gap:10px;align-items:center}
+.jy-close{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);color:#f5f0e0;padding:8px 18px;border-radius:var(--r);font-size:12px;font-weight:700;cursor:pointer;letter-spacing:1px;transition:all .2s}
+.jy-close:hover{background:rgba(192,57,43,.6)}
+.jy-filter{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.15);color:#f5f0e0;padding:8px 14px;border-radius:var(--r);font-size:12px;outline:none;margin-bottom:16px}
+
+/* PRINT */
+@media print{
+  #loginScreen,#welcomeScreen,#topbar,#nav,.no-print,#jyvosPanel{display:none!important}
+  #main{padding:0;overflow:visible;background:#fff}
+  body{background:#fff;color:#000;overflow:auto}
+  .rp-titre{background:#f5f0e0!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .rp-table thead tr{background:#f0ece0!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .rp-caisses-table th,.rp-caisses-table td.row-lbl,.rp-caisses-table tr:last-child td{background:#f0ece0!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .rp-vide td{background:#fafaf8!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .rp-total{background:#f0ece0!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .rp-solde{background:#f5f0e0!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .rp-caisses-wrap,.rp-benef-wrap,.rp-twrap{overflow:visible!important}
+  .sec:not(.on){display:none!important}
+  .card,.twrap,.mrow,.ncard,.bcard{box-shadow:none!important}
+}
+@media(max-width:600px){
+  #main{padding:10px}
+  .sgrid{grid-template-columns:1fr 1fr}
+  .fgrid{grid-template-columns:1fr}
+  #topbar .tname,#topbar .trole{display:none}
+  #topbar #connectStatus span:last-child{display:none}
+  .wbox{padding:32px 24px}
+}
+@media(max-width:400px){
+  #main{padding:8px}
+}
+</style>
+</head>
+<body>
+
+<div id="offlineBanner"></div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     ÉCRAN D'ACCUEIL MULTI-ÉTAPES
+══════════════════════════════════════════════════════════════════════════ -->
+<div id="welcomeScreen">
+  <div class="wbox">
+    <div class="wicon">✝️</div>
+    <h1>CHURCH LEDGER</h1>
+    <p class="wsub">Gestion Financière Multi-Église</p>
+
+    <!-- ÉTAPE 1 : Choix action -->
+    <div class="wstep on" id="wStep1">
+      <div style="font-size:13px;color:var(--text2);text-align:center;margin-bottom:20px;line-height:1.6">Bienvenue ! Sélectionnez votre église ou inscrivez votre communauté.</div>
+      <button class="wbtn pri" onclick="wGoStep('wStep2')" style="width:100%;margin-bottom:10px">🏛 Se connecter à mon église</button>
+      <button class="wbtn sec" onclick="wGoStep('wStepInscription')" style="width:100%;margin-bottom:10px">✨ Inscrire mon église</button>
+      <div class="wdivider">accès interne</div>
+      <button class="wbtn sec" onclick="wGoJyvos()" style="width:100%;font-size:11px;padding:10px">🔐 Accès JYVOS (admin système)</button>
+    </div>
+
+    <!-- ÉTAPE 2 : Sélection église -->
+    <div class="wstep" id="wStep2">
+      <button class="wback" onclick="wGoStep('wStep1')">← Retour</button>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:14px">Sélectionnez votre église :</div>
+      <input type="text" id="wSearchEglise" placeholder="🔍 Rechercher par nom ou ville…" oninput="filterEglises()" style="width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:var(--r);font-size:13px;background:var(--bg3);color:var(--text);outline:none;margin-bottom:12px">
+      <div class="eglise-scroll" id="wEgliseList">
+        <div style="text-align:center;padding:20px;color:var(--text3);font-size:12px">Chargement…</div>
+      </div>
+      <p class="werr" id="wErrStep2"></p>
+    </div>
+
+    <!-- ÉTAPE INSCRIPTION -->
+    <div class="wstep" id="wStepInscription">
+      <button class="wback" onclick="wGoStep('wStep1')">← Retour</button>
+      <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:16px">Inscrire mon église</div>
+      <div id="wInscriptionAlert"></div>
+      <div id="wInscriptionForm">
+        <label class="wlbl">Nom de l'église <span class="req">*</span></label>
+        <input type="text" id="wiNom" placeholder="Ex: Église de la Grâce Mbankomo">
+        <label class="wlbl">Nom du Pasteur <span class="req">*</span></label>
+        <input type="text" id="wiPasteur" placeholder="Pasteur Jean Dupont">
+        <label class="wlbl">Ville <span class="req">*</span></label>
+        <input type="text" id="wiVille" placeholder="Ex: Yaoundé, Douala…">
+        <label class="wlbl">Email (optionnel)</label>
+        <input type="email" id="wiEmail" placeholder="contact@eglise.cm">
+        <label class="wlbl">Téléphone (optionnel)</label>
+        <input type="tel" id="wiContact" placeholder="+237 6xx xxx xxx">
+        <p class="werr" id="wErrInscription"></p>
+        <button class="wbtn pri" onclick="soumettreInscription()" style="width:100%;margin-top:4px">✅ Soumettre la demande</button>
+      </div>
+      <div id="wInscriptionOk" style="display:none">
+        <div style="text-align:center;padding:20px 0">
+          <div style="font-size:48px;margin-bottom:12px">⏳</div>
+          <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:8px">Demande envoyée !</div>
+          <div style="font-size:13px;color:var(--text2);line-height:1.6">Votre inscription est <strong>en attente de validation</strong> par l'équipe JYVOS. Vous serez notifié dès l'activation de votre compte.</div>
+        </div>
+        <button class="wbtn sec" onclick="wGoStep('wStep1')" style="width:100%;margin-top:10px">← Retour à l'accueil</button>
+      </div>
+    </div>
+
+    <!-- CONNEXION JYVOS (Login secret) -->
+    <div class="wstep" id="wStepJyvos">
+      <button class="wback" onclick="wGoStep('wStep1')">← Retour</button>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:16px">Accès administrateur JYVOS</div>
+      <label class="wlbl">Code d'accès JYVOS</label>
+      <div class="pinwrap"><input type="password" id="wJyvosPin" maxlength="8" placeholder="• • • • • •" onkeydown="if(event.key==='Enter')checkJyvosPin()"></div>
+      <p class="werr" id="wErrJyvos"></p>
+      <button class="wbtn pri" onclick="checkJyvosPin()" style="width:100%;margin-top:4px">Accéder au panneau JYVOS</button>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     LOGIN MEMBRES (après sélection de l'église)
+══════════════════════════════════════════════════════════════════════════ -->
+<div id="loginScreen" style="display:none">
+  <div class="lbox">
+    <div class="licon">✝️</div>
+    <h1>CHURCH LEDGER</h1>
+    <p class="lsub">Gestion Financière</p>
+    <div class="leglise-name" id="loginEgliseName">—</div>
+    <label class="lbl">Compte</label>
+    <select id="lsel"></select>
+    <label class="lbl">Code PIN</label>
+    <div class="pinwrap2"><input type="password" id="lpin" maxlength="6" placeholder="• • • •" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <button class="lbtn" onclick="doLogin()">SE CONNECTER</button>
+    <p class="lerr" id="lerr"></p>
+    <button class="lchange-eglise" onclick="changerEglise()">🔄 Changer d'église</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     APPLICATION PRINCIPALE
+══════════════════════════════════════════════════════════════════════════ -->
+<div id="app">
+  <div id="topbar">
+    <div class="tlogo">
+      <span>✝</span>
+      <div>
+        CHURCH LEDGER
+        <small>Gestion Financière</small>
+        <span class="teglise" id="topEgliseName"></span>
+      </div>
+    </div>
+    <div class="tavatar" id="tbAvt">?</div>
+    <span class="tname" id="tbNom"></span>
+    <span class="trole" id="tbRole"></span>
+    <span id="connectStatus" class="tconnect online"><span class="dot"></span><span id="connectLabel">EN LIGNE</span></span>
+    <button class="tlogout" onclick="openProfil()" style="border-color:var(--border2);color:var(--gold)">⚙ Mon profil</button>
+    <button class="tlogout" onclick="doLogout()">Déconnexion</button>
+  </div>
+  <div id="nav">
+    <button class="nbtn on" onclick="nav('dashboard',this)">📊 Dashboard</button>
+    <button class="nbtn" onclick="nav('caisses',this)">🏦 Caisses</button>
+    <button class="nbtn" onclick="nav('entrees',this)">📥 Entrées</button>
+    <button class="nbtn" onclick="nav('sorties',this)">📤 Sorties</button>
+    <button class="nbtn" onclick="nav('beneficiaires',this)">👥 Bénéficiaires</button>
+    <button class="nbtn" onclick="nav('rapports',this)">📋 Rapports</button>
+    <button class="nbtn" onclick="nav('notes',this)">📝 Notes</button>
+    <button class="nbtn" id="navMembres" onclick="nav('membres',this)">🔑 Membres</button>
+    <button class="nbtn" id="navParams" onclick="nav('params',this)">⚙️ Paramètres</button>
+  </div>
+  <div id="main">
+
+    <!-- DASHBOARD -->
+    <div class="sec on" id="sec-dashboard">
+      <div class="ph">
+        <div><h2>TABLEAU DE BORD</h2><small id="dDate"></small></div>
+        <div style="display:flex;gap:8px" class="no-print">
+          <button class="btn sec sm" onclick="buildDashboard()">↻ Actualiser</button>
+          <button class="btn sec sm" onclick="window.print()">🖨 Imprimer</button>
+        </div>
+      </div>
+      <div id="dAlert"></div>
+      <div class="sgrid" id="dStats"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px">
+        <div class="card"><div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;font-weight:700">Entrées vs Sorties — 6 mois</div><div class="chwrap"><canvas id="chartBar"></canvas></div></div>
+        <div class="card"><div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;font-weight:700">Soldes par caisse</div><div class="chwrap"><canvas id="chartDonut"></canvas></div></div>
+      </div>
+      <div class="card">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:2px;margin-bottom:14px;font-weight:700">CAISSES — Cliquer pour voir le détail</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px" id="dCaisses"></div>
+      </div>
+      <div style="margin-top:16px" class="card">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:2px;margin-bottom:14px;font-weight:700">Dernières transactions</div>
+        <div class="twrap"><table><thead><tr><th>Date</th><th>Type</th><th>Caisse</th><th>Désignation</th><th>Montant</th><th>Par</th></tr></thead><tbody id="dTrans"></tbody></table></div>
+      </div>
+    </div>
+
+    <!-- CAISSES -->
+    <div class="sec" id="sec-caisses">
+      <div id="listeCaisses">
+        <div class="ph"><div><h2>CAISSES</h2><small>Cliquer sur une caisse pour voir toutes ses transactions</small></div></div>
+        <div class="caisses-grid" id="caissesGrid"></div>
+      </div>
+      <div id="detailCaisse" style="display:none">
+        <button class="back-btn no-print" onclick="retourCaisses()">← Toutes les caisses</button>
+        <div class="ph">
+          <div><h2 id="detailTitre"></h2><small id="detailSub"></small></div>
+          <div style="display:flex;gap:8px" class="no-print">
+            <button class="btn sec sm" onclick="openModalEntree()">📥 Entrée</button>
+            <button class="btn pri sm" onclick="openModalSortie()">📤 Sortie</button>
+            <button class="btn sec sm" id="btnReinit" onclick="openModalReinit()" style="color:var(--red);border-color:var(--red)">🔄 Réinitialiser</button>
+          </div>
+        </div>
+        <div class="sgrid" id="detailStats"></div>
+        <div class="card">
+          <div class="filt no-print">
+            <input type="date" id="filtCDateD" placeholder="Du…" onchange="renderDetailCaisse()">
+            <input type="date" id="filtCDateF" placeholder="Au…" onchange="renderDetailCaisse()">
+            <input type="text" id="filtCSearch" placeholder="Rechercher…" oninput="renderDetailCaisse()" style="min-width:160px">
+          </div>
+          <div class="twrap"><table><thead><tr><th>Date</th><th>Heure</th><th>Type</th><th>Montant</th><th>Destinataire/Donateur</th><th>Motif/Commentaire</th><th>Par</th><th class="no-print">Actions</th></tr></thead><tbody id="detailTrans"></tbody></table></div>
+          <div style="margin-top:10px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+            <span id="detailTotal" style="font-size:12px;color:var(--text3);font-weight:600"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ENTRÉES -->
+    <div class="sec" id="sec-entrees">
+      <div class="ph">
+        <div><h2>ENTRÉES</h2><small>Toutes les recettes enregistrées</small></div>
+        <button class="btn pri no-print" onclick="openModalEntree()">+ Nouvelle entrée</button>
+      </div>
+      <div class="filt">
+        <select id="filtECaisse" onchange="renderEntrees()"><option value="">Toutes les caisses</option></select>
+        <input type="date" id="filtEDateD" onchange="renderEntrees()">
+        <input type="date" id="filtEDateF" onchange="renderEntrees()">
+        <input type="text" id="filtESearch" placeholder="Chercher…" oninput="renderEntrees()" style="min-width:150px">
+      </div>
+      <div class="twrap"><table><thead><tr><th>Date</th><th>Heure</th><th>Jour</th><th>Caisse</th><th>Montant</th><th>Donateur</th><th>Commentaire</th><th>Par</th><th class="no-print">Actions</th></tr></thead><tbody id="tEntrees"></tbody></table></div>
+      <div style="margin-top:10px"><span id="entreesTotal" style="font-size:12px;color:var(--text3);font-weight:600"></span></div>
+    </div>
+
+    <!-- SORTIES -->
+    <div class="sec" id="sec-sorties">
+      <div class="ph">
+        <div><h2>SORTIES</h2><small>Toutes les dépenses enregistrées</small></div>
+        <button class="btn pri no-print" onclick="openModalSortie()">+ Nouvelle sortie</button>
+      </div>
+      <div class="filt">
+        <select id="filtSCaisse" onchange="renderSorties()"><option value="">Toutes les caisses</option></select>
+        <input type="date" id="filtSDateD" onchange="renderSorties()">
+        <input type="date" id="filtSDateF" onchange="renderSorties()">
+        <input type="text" id="filtSSearch" placeholder="Chercher…" oninput="renderSorties()" style="min-width:150px">
+      </div>
+      <div class="twrap"><table><thead><tr><th>Date</th><th>Heure</th><th>Jour</th><th>Caisse</th><th>FR (Bénéf.)</th><th>Montant</th><th>Motif</th><th>Justification</th><th>SR (Resp.)</th><th class="no-print">Action</th></tr></thead><tbody id="tSorties"></tbody></table></div>
+      <div style="margin-top:10px"><span id="sortiesTotal" style="font-size:12px;color:var(--text3);font-weight:600"></span></div>
+    </div>
+
+    <!-- BÉNÉFICIAIRES -->
+    <div class="sec" id="sec-beneficiaires">
+      <div class="ph"><div><h2>BÉNÉFICIAIRES</h2><small>Historique complet — qui a reçu, combien de fois, quand</small></div></div>
+      <div class="filt">
+        <select id="filtBCaisse" onchange="renderBenef()"><option value="">Toutes les caisses</option></select>
+        <select id="filtBAnnee" onchange="renderBenef()"><option value="">Toutes les années</option></select>
+        <input type="text" id="filtBSearch" placeholder="Chercher par nom…" oninput="renderBenef()" style="min-width:160px">
+      </div>
+      <div id="benefContent"></div>
+    </div>
+
+    <!-- RAPPORTS -->
+    <div class="sec" id="sec-rapports">
+      <div class="ph"><div><h2>RAPPORTS</h2><small>Journalier · Mensuel · Annuel — imprimables</small></div>
+        <div style="display:flex;gap:8px" class="no-print">
+          <button class="btn sec sm" onclick="window.print()">🖨 Imprimer</button>
+          <button class="btn pri sm" onclick="telechargerPDF()" id="btnPDF">⬇ PDF</button>
+        </div>
+      </div>
+      <div class="no-print" style="margin-bottom:18px;position:sticky;top:0;background:var(--bg);padding:10px 0;z-index:50">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">
+          <button id="rtJour" onclick="setRT('jour')" style="padding:14px 6px;font-size:13px;font-weight:700;border-radius:8px;border:2px solid var(--gold);background:var(--gold);color:#fff;cursor:pointer">📋 Journalier</button>
+          <button id="rtMois" onclick="setRT('mois')" style="padding:14px 6px;font-size:13px;font-weight:700;border-radius:8px;border:2px solid var(--border);background:#fff;color:var(--text2);cursor:pointer">📅 Mensuel</button>
+          <button id="rtAnnee" onclick="setRT('annee')" style="padding:14px 6px;font-size:13px;font-weight:700;border-radius:8px;border:2px solid var(--border);background:#fff;color:var(--text2);cursor:pointer">📆 Annuel</button>
+        </div>
+        <div id="rapportFiltDate"></div>
+      </div>
+      <div id="rapportContent"></div>
+    </div>
+
+    <!-- NOTES -->
+    <div class="sec" id="sec-notes">
+      <div class="ph"><div><h2>NOTES</h2><small>Observations et remarques du trésorier</small></div></div>
+      <div class="card" style="margin-bottom:16px">
+        <div class="fgrid">
+          <div class="fg"><label>Catégorie</label><select id="noteCat"><option value="general">Général</option><option value="entree">Entrée</option><option value="sortie">Sortie</option><option value="observation">Observation</option><option value="audit">Audit</option></select></div>
+          <div class="fg" style="grid-column:span 2"><label>Note <span class="req">*</span></label><textarea id="noteText" placeholder="Saisir votre note ou observation…"></textarea></div>
+        </div>
+        <div class="factions"><button class="btn pri" onclick="saveNote()">Enregistrer la note</button></div>
+      </div>
+      <div id="notesList"></div>
+    </div>
+
+    <!-- MEMBRES -->
+    <div class="sec" id="sec-membres">
+      <div class="ph"><div><h2>MEMBRES</h2><small>Gestion des accès — Administrateur uniquement</small></div>
+        <button class="btn pri no-print" onclick="editMembreId=null;document.getElementById('mMembreTitle').textContent='NOUVEAU MEMBRE';resetMembreForm();openModal('mMembre')">+ Ajouter membre</button>
+      </div>
+      <div id="membresList"></div>
+    </div>
+
+    <!-- PARAMÈTRES -->
+    <div class="sec" id="sec-params">
+      <div class="ph"><div><h2>PARAMÈTRES</h2><small>Configuration et réinitialisation des données</small></div></div>
+      <div id="paramsAdminOnly" style="display:none">
+        <div class="card" style="margin-bottom:16px;border-left:4px solid var(--red)">
+          <div style="font-size:13px;font-weight:700;color:var(--red);margin-bottom:6px">🚨 Zone dangereuse — Réinitialisation</div>
+          <p style="font-size:12px;color:var(--text2);margin-bottom:16px;line-height:1.6">Ces actions sont <strong>irréversibles</strong>. Elles effacent définitivement les données de cette église.</p>
+          <div style="display:flex;flex-wrap:wrap;gap:10px">
+            <button class="btn dan" onclick="resetEntrees()">🗑 Effacer toutes les entrées</button>
+            <button class="btn dan" onclick="resetSorties()">🗑 Effacer toutes les sorties</button>
+            <button class="btn dan" onclick="resetNotes()">🗑 Effacer toutes les notes</button>
+            <button class="btn dan" style="background:#c0392b;color:#fff;border:none" onclick="resetTotal()">⚠️ Réinitialisation complète</button>
+          </div>
+        </div>
+        <div class="card" style="border-left:4px solid var(--blue)">
+          <div style="font-size:13px;font-weight:700;color:var(--blue);margin-bottom:6px">📦 Sauvegarde</div>
+          <p style="font-size:12px;color:var(--text2);margin-bottom:12px">Exporter toutes les données en JSON.</p>
+          <button class="btn sec" onclick="exportJSON()">⬇️ Télécharger sauvegarde JSON</button>
+        </div>
+      </div>
+      <div id="paramsNoAdmin" style="display:none">
+        <div class="al info">ℹ️ Cette section est réservée aux administrateurs.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     PANNEAU JYVOS ADMIN
+══════════════════════════════════════════════════════════════════════════ -->
+<div id="jyvosPanel">
+  <div class="jy-header">
+    <div>
+      <div class="jy-logo">JYVOS <small>Administration système — Church Ledger</small></div>
+    </div>
+    <div class="jy-actions">
+      <button class="jy-btn voir" onclick="jyvosRefresh()">↻ Actualiser</button>
+      <button class="jy-close" onclick="fermerJyvos()">✕ Fermer</button>
+    </div>
+  </div>
+  <div class="jy-body">
+    <div class="jy-stats" id="jyStats">
+      <div class="jy-stat"><div class="js-label">Total Églises</div><div class="js-val" id="jsTotal">—</div></div>
+      <div class="jy-stat"><div class="js-label">Actives</div><div class="js-val" id="jsActives" style="color:#1a7a3a">—</div></div>
+      <div class="jy-stat"><div class="js-label">En attente</div><div class="js-val" id="jsAttente" style="color:#b8941f">—</div></div>
+      <div class="jy-stat"><div class="js-label">Suspendues</div><div class="js-val" id="jsSuspendues" style="color:#c0392b">—</div></div>
+    </div>
+
+    <div class="jy-section-title">📋 Gestion des Églises</div>
+    <input type="text" class="jy-filter" id="jySearch" placeholder="🔍 Rechercher une église…" oninput="renderJyvosTable()" style="width:100%;max-width:400px">
+    <div style="overflow-x:auto">
+      <table class="jy-table" id="jyTable">
+        <thead>
+          <tr>
+            <th>Église</th>
+            <th>Pasteur</th>
+            <th>Ville</th>
+            <th>Email / Contact</th>
+            <th>Date inscription</th>
+            <th>Statut</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="jyTableBody">
+          <tr><td colspan="7" style="text-align:center;color:rgba(255,255,255,.3);padding:30px">Chargement…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     MODALS
+══════════════════════════════════════════════════════════════════════════ -->
+
+<!-- MODAL ENTRÉE -->
+<div class="mover" id="mEntree">
+  <div class="mbox" style="max-width:820px">
+    <div style="margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--border)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <h3 id="mEntreeTitre" style="font-family:'Cinzel','Georgia',serif;font-size:14px;color:var(--gold);letter-spacing:2px;font-weight:700">NOUVELLE ENTRÉE</h3>
+        <button class="mclose" onclick="closeModal('mEntree')">✕</button>
+      </div>
+      <div style="width:100%;overflow:hidden">
+        <button id="eBtnSimple" class="btn pri sm" onclick="setModeEntree('simple')" style="display:inline-block;width:calc(50% - 4px);margin-right:8px;box-sizing:border-box">Unique</button><button id="eBtnMulti" class="btn sec sm" onclick="setModeEntree('multi')" style="display:inline-block;width:calc(50% - 4px);box-sizing:border-box">⚡ Multiple</button>
+      </div>
+    </div>
+    <div id="mEntreeAlert"></div>
+    <div id="eSimple">
+      <div class="fgrid" style="margin-bottom:14px">
+        <div class="fg"><label>Date <span class="req">*</span></label><input type="date" id="eDate"></div>
+        <div class="fg"><label>Caisse <span class="req">*</span></label><select id="eCaisse"></select></div>
+        <div class="fg"><label>Montant (FCFA) <span class="req">*</span></label><input type="number" id="eMontant" placeholder="0" min="0"></div>
+        <div class="fg"><label>Donateur (optionnel)</label><div style="display:flex;gap:6px"><select id="eDonateurTitre" style="padding:8px;border:1px solid var(--border);border-radius:var(--r);font-size:12px;background:var(--bg3);color:var(--text);min-width:110px"><option value="">Non spécifié</option><option value="Fr.">Fr.</option><option value="Sœur">Sœur</option></select><input type="text" id="eDonateur" placeholder="Nom" style="flex:1"></div></div>
+        <div class="fg" style="grid-column:span 2"><label>Commentaire</label><textarea id="eComment" placeholder="Observations…" rows="2"></textarea></div>
+      </div>
+      <div class="factions"><button class="btn pri" onclick="saveEntreeSimple()">✓ Enregistrer</button><button class="btn sec" onclick="closeModal('mEntree')">Annuler</button></div>
+    </div>
+    <div id="eMulti" style="display:none">
+      <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+        <div class="fg" style="flex:1;min-width:140px"><label>Date commune <span class="req">*</span></label><input type="date" id="eDateM"></div>
+        <div class="fg" style="flex:1;min-width:160px"><label>Caisse commune <span class="req">*</span></label><select id="eCaisseM"></select></div>
+        <div style="display:flex;align-items:flex-end;gap:6px">
+          <button class="btn sec sm" onclick="addLigneEntree()">+ Ligne</button>
+          <button class="btn sec sm" onclick="clearLignesEntree()" style="color:var(--red)">🗑</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:8px;display:flex;justify-content:space-between">
+        <span>💡 Tab pour passer au champ suivant — Entrée pour ajouter une ligne</span>
+        <span id="eCompteur" style="font-weight:700;color:var(--gold)">0 ligne</span>
+      </div>
+      <div style="overflow-x:auto;margin-bottom:10px">
+        <table style="width:100%;border-collapse:collapse;min-width:520px">
+          <thead><tr style="background:var(--bg4)">
+            <th style="padding:8px 10px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2);white-space:nowrap">#</th>
+            <th style="padding:8px 10px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2);white-space:nowrap">Montant (FCFA) *</th>
+            <th style="padding:8px 10px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2)">Donateur</th>
+            <th style="padding:8px 10px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2)">Commentaire</th>
+            <th style="padding:8px 10px;border-bottom:2px solid var(--border2)"></th>
+          </tr></thead>
+          <tbody id="eLignes"></tbody>
+        </table>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:4px">
+        <span id="eTotalMulti" style="font-size:13px;font-weight:700;color:var(--green)"></span>
+        <div class="factions" style="margin:0"><button class="btn pri" onclick="saveEntree()">✓ Enregistrer tout</button><button class="btn sec" onclick="closeModal('mEntree')">Annuler</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL SORTIE -->
+<div class="mover" id="mSortie">
+  <div class="mbox" style="max-width:960px">
+    <div style="margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--border)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <h3 id="mSortieTitre" style="font-family:'Cinzel','Georgia',serif;font-size:14px;color:var(--gold);letter-spacing:2px;font-weight:700">NOUVELLE SORTIE</h3>
+        <button class="mclose" onclick="closeModal('mSortie')">✕</button>
+      </div>
+      <div style="width:100%;overflow:hidden">
+        <button id="sBtnSimple" class="btn pri sm" onclick="setModeSortie('simple')" style="display:inline-block;width:calc(50% - 4px);margin-right:8px;box-sizing:border-box">Unique</button><button id="sBtnMulti" class="btn sec sm" onclick="setModeSortie('multi')" style="display:inline-block;width:calc(50% - 4px);box-sizing:border-box">⚡ Multiple</button>
+      </div>
+    </div>
+    <div id="mSortieAlert"></div>
+    <div id="sSortieSimple">
+      <div class="fgrid" style="margin-bottom:14px">
+        <div class="fg"><label>Date <span class="req">*</span></label><input type="date" id="sDate"></div>
+        <div class="fg"><label>Caisse <span class="req">*</span></label><select id="sCaisse"></select></div>
+        <div class="fg"><label>Montant (FCFA) <span class="req">*</span></label><input type="number" id="sMontant" placeholder="0" min="0"></div>
+        <div class="fg"><label>Destinataire</label><div style="display:flex;gap:6px"><select id="sDestTitre" style="padding:8px;border:1px solid var(--border);border-radius:var(--r);font-size:12px;background:var(--bg3);color:var(--text);min-width:110px"><option value="">Non spécifié</option><option value="Fr.">Fr.</option><option value="Sœur">Sœur</option></select><input type="text" id="sDest" placeholder="Nom complet" style="flex:1"></div></div>
+        <div class="fg"><label>Délivré par</label><input type="text" id="sDelivre" placeholder="Nom du responsable"></div>
+        <div class="fg"><label>Motif</label><input type="text" id="sMotif" placeholder="Raison de la sortie"></div>
+        <div class="fg" style="grid-column:span 2"><label>Justification</label><textarea id="sJustif" placeholder="Description complète…" rows="2"></textarea></div>
+      </div>
+      <div class="factions"><button class="btn pri" onclick="saveSortieSimple()">✓ Enregistrer</button><button class="btn sec" onclick="closeModal('mSortie')">Annuler</button></div>
+    </div>
+    <div id="sSortieMulti" style="display:none">
+      <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+        <div class="fg" style="flex:1;min-width:140px"><label>Date commune <span class="req">*</span></label><input type="date" id="sDateM"></div>
+        <div class="fg" style="flex:1;min-width:160px"><label>Caisse commune <span class="req">*</span></label><select id="sCaisseM"></select></div>
+        <div style="display:flex;align-items:flex-end;gap:6px">
+          <button class="btn sec sm" onclick="addLigneSortie()">+ Ligne</button>
+          <button class="btn sec sm" onclick="clearLignesSortie()" style="color:var(--red)">🗑</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:8px;display:flex;justify-content:space-between">
+        <span>💡 Tab pour naviguer — Entrée sur la dernière cellule pour ajouter une ligne</span>
+        <span id="sCompteur" style="font-weight:700;color:var(--gold)">0 ligne</span>
+      </div>
+      <div style="overflow-x:auto;margin-bottom:10px">
+        <table style="width:100%;border-collapse:collapse;min-width:700px">
+          <thead><tr style="background:var(--bg4)">
+            <th style="padding:8px 8px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2);white-space:nowrap">#</th>
+            <th style="padding:8px 8px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2);white-space:nowrap">Montant *</th>
+            <th style="padding:8px 8px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2);white-space:nowrap">Destinataire</th>
+            <th style="padding:8px 8px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2);white-space:nowrap">Délivré par</th>
+            <th style="padding:8px 8px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2)">Motif</th>
+            <th style="padding:8px 8px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);font-weight:700;text-align:left;border-bottom:2px solid var(--border2)">Justification</th>
+            <th style="padding:8px 8px;border-bottom:2px solid var(--border2)"></th>
+          </tr></thead>
+          <tbody id="sLignes"></tbody>
+        </table>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:4px">
+        <span id="sTotalMulti" style="font-size:13px;font-weight:700;color:var(--red)"></span>
+        <div class="factions" style="margin:0"><button class="btn pri" onclick="saveSortie()">✓ Enregistrer tout</button><button class="btn sec" onclick="closeModal('mSortie')">Annuler</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL MEMBRE -->
+<div class="mover" id="mMembre">
+  <div class="mbox">
+    <div class="mhdr"><h3 id="mMembreTitle">NOUVEAU MEMBRE</h3><button class="mclose" onclick="closeModal('mMembre')">✕</button></div>
+    <div class="fgrid">
+      <div class="fg"><label>Nom complet <span class="req">*</span></label><input type="text" id="mNom" placeholder="Prénom NOM"></div>
+      <div class="fg"><label>Contact</label><input type="text" id="mContact" placeholder="+237 …"></div>
+      <div class="fg"><label>Rôle</label><select id="mRole"><option value="admin">Administrateur</option><option value="membre" selected>Membre</option></select></div>
+      <div class="fg"><label>Code PIN <span class="req">*</span></label><input type="password" id="mPin" placeholder="• • • •" maxlength="6"></div>
+      <div class="fg" style="grid-column:span 2"><label>Statut d'accès</label><select id="mStatut"><option value="actif">✅ Actif — accès autorisé</option><option value="bloque">🚫 Bloqué — accès refusé</option></select></div>
+      <div class="fg" style="grid-column:span 2"><label>Caisses autorisées</label><div id="mCaissesCheck" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px"></div></div>
+    </div>
+    <div class="factions"><button class="btn pri" onclick="saveMembre()">Enregistrer</button><button class="btn sec" onclick="closeModal('mMembre')">Annuler</button></div>
+  </div>
+</div>
+
+<!-- MODAL MODIFIER ENTRÉE -->
+<div class="mover" id="mEditEntree">
+  <div class="mbox">
+    <div class="mhdr"><h3>✏️ MODIFIER ENTRÉE</h3><button class="mclose" onclick="closeModal('mEditEntree')">✕</button></div>
+    <div id="mEditEntreeAlert"></div>
+    <div class="fgrid">
+      <div class="fg"><label>Caisse <span class="req">*</span></label><select id="eeC"></select></div>
+      <div class="fg"><label>Montant (FCFA) <span class="req">*</span></label><input type="number" id="eeM" placeholder="0" min="0"></div>
+      <div class="fg"><label>Donateur</label><input type="text" id="eeD" placeholder="Nom du donateur"></div>
+      <div class="fg" style="grid-column:span 2"><label>Commentaire</label><textarea id="eeCom" placeholder="Observations…"></textarea></div>
+    </div>
+    <div class="factions">
+      <button class="btn pri" onclick="saveEditEntree()">💾 Enregistrer</button>
+      <button class="btn sec" onclick="closeModal('mEditEntree')">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL MODIFIER SORTIE -->
+<div class="mover" id="mEditSortie">
+  <div class="mbox">
+    <div class="mhdr"><h3>✏️ MODIFIER SORTIE</h3><button class="mclose" onclick="closeModal('mEditSortie')">✕</button></div>
+    <div id="mEditSortieAlert"></div>
+    <div class="fgrid">
+      <div class="fg"><label>Caisse <span class="req">*</span></label><select id="esC"></select></div>
+      <div class="fg"><label>Montant (FCFA) <span class="req">*</span></label><input type="number" id="esM" placeholder="0" min="0"></div>
+      <div class="fg"><label>Destinataire <span class="req">*</span></label><input type="text" id="esD" placeholder="Nom du destinataire"></div>
+      <div class="fg"><label>Motif <span class="req">*</span></label><input type="text" id="esMo" placeholder="Raison de la sortie"></div>
+      <div class="fg" style="grid-column:span 2"><label>Justification <span class="req">*</span></label><textarea id="esJ" placeholder="Description complète…"></textarea></div>
+    </div>
+    <div class="factions">
+      <button class="btn pri" onclick="saveEditSortie()">💾 Enregistrer</button>
+      <button class="btn sec" onclick="closeModal('mEditSortie')">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL MON PROFIL -->
+<div class="mover" id="mProfil">
+  <div class="mbox">
+    <div class="mhdr"><h3>⚙ MON PROFIL</h3><button class="mclose" onclick="closeModal('mProfil')">✕</button></div>
+    <div id="mProfilAlert"></div>
+    <div class="fgrid">
+      <div class="fg"><label>Nom complet</label><input type="text" id="pNom"></div>
+      <div class="fg"><label>Contact</label><input type="text" id="pContact"></div>
+      <div class="fg"><label>PIN actuel <span class="req">*</span></label><input type="password" id="pPinActuel" placeholder="• • • •" maxlength="6"></div>
+      <div class="fg"><label>Nouveau PIN (optionnel)</label><input type="password" id="pPinNouv" placeholder="• • • •" maxlength="6"></div>
+      <div class="fg"><label>Confirmer nouveau PIN</label><input type="password" id="pPinConf" placeholder="• • • •" maxlength="6"></div>
+    </div>
+    <div class="factions">
+      <button class="btn pri" onclick="saveProfil()">💾 Enregistrer</button>
+      <button class="btn sec" onclick="closeModal('mProfil')">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL RÉINITIALISER CAISSE -->
+<div class="mover" id="mReinit">
+  <div class="mbox" style="max-width:420px">
+    <div class="mhdr"><h3>🔄 RÉINITIALISER LA CAISSE</h3><button class="mclose" onclick="closeModal('mReinit')">✕</button></div>
+    <div class="al err" style="margin-bottom:16px">⚠️ Cette action supprimera <strong>toutes les transactions</strong> de cette caisse. Elle est irréversible.</div>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:18px">Caisse concernée : <strong id="reinitNom" style="color:var(--gold)"></strong></p>
+    <div class="fg" style="margin-bottom:18px"><label>Confirmez votre PIN Admin <span class="req">*</span></label><input type="password" id="reinitPin" placeholder="• • • •" maxlength="6"></div>
+    <div id="reinitAlert"></div>
+    <div class="factions">
+      <button class="btn dan" onclick="executeReinit()">🗑 Confirmer la réinitialisation</button>
+      <button class="btn sec" onclick="closeModal('mReinit')">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     JAVASCRIPT
+══════════════════════════════════════════════════════════════════════════ -->
+<script>
+const CAISSES=[
+  {id:'offrande',nom:'Offrande',icon:'🙏',culte:true},
+  {id:'dime',nom:'Dîme',icon:'📊'},
+  {id:'dime-dimes',nom:'Dîme des dîmes',icon:'💎'},
+  {id:'missionnaire',nom:'Œuvre Missionnaire',icon:'🌍'},
+  {id:'construction',nom:'Construction',icon:'🏗️'},
+  {id:'voix-dieu',nom:'Voix de Dieu',icon:'📻'},
+  {id:'commando',nom:'Commando',icon:'⚔️'},
+  {id:'contribution',nom:'Contribution',icon:'🤝'},
+];
+const JOURS=['Dimanche','Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi'];
+const MOIS=['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+const JOURS_CULTE=[0,3,5];
+
+// ─── CODE JYVOS SECRET (à personnaliser) ───────────────────────────────────
+const JYVOS_CODE = 'JYVOS2024';
+
+let currentUser=null, currentCaisse=null, rapportType='jour', editMembreId=null;
+let _eglisesList=[], _editEntreeId=null, _editSortieId=null;
+
+window.CAISSES_IDS = CAISSES.map(c=>c.id);
+
+function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7)}
+
+// ─── STATUT CONNEXION ──────────────────────────────────────────────────────
+window._showSyncStatus = function(status) {
+  const el = document.getElementById('offlineBanner');
+  if (!el) return;
+  if (status === 'offline') {
+    el.className = 'offline';
+    el.innerHTML = '📴 MODE HORS LIGNE — Les données sont sauvegardées localement';
+    el.style.display = 'block';
+    el.style.opacity = '1';
+  } else if (status === 'syncing') {
+    el.className = 'syncing';
+    el.innerHTML = '🔄 Synchronisation en cours…';
+    el.style.display = 'block';
+    el.style.opacity = '1';
+  } else if (status === 'synced') {
+    el.className = 'synced';
+    el.innerHTML = '✅ Données synchronisées';
+    el.style.display = 'block';
+    el.style.opacity = '1';
+    setTimeout(() => { el.style.display = 'none'; }, 3000);
+  } else {
+    el.style.display = 'none';
+  }
+  // Décaler l'app vers le bas si bannière visible
+  const app = document.getElementById('app');
+  if (app && status === 'offline') app.style.paddingTop = '36px';
+  else if (app) app.style.paddingTop = '';
+};
+
+// Sync périodique quand le réseau revient
+window.addEventListener('online', async () => {
+  updateConnectStatus();
+  if (window._flushPending) {
+    window._showSyncStatus('syncing');
+    await window._flushPending();
+    // Re-charger depuis Firebase pour rester à jour
+    if (window._currentEgliseId) {
+      await window.loadFirestoreData(window._currentEgliseId);
+      buildDashboard();
+    }
+  }
+});
+window.addEventListener('offline', () => {
+  updateConnectStatus();
+  window._showSyncStatus('offline');
+});
+function fmt(n){return Number(n).toLocaleString('fr-FR')+' FCFA'}
+function fmtS(n){return Number(n).toLocaleString('fr-FR')}
+function dFR(d){if(!d)return'';const p=d.split('-');return`${p[2]}/${p[1]}/${p[0]}`}
+function titrePers(titre){return titre==='Fr.'?'Fr.':titre==='Sœur'?'Sœur':'Non spécifié'}
+function getJour(d){if(!d)return'';return JOURS[new Date(d+'T12:00:00').getDay()]}
+function getCaisse(id){return CAISSES.find(c=>c.id===id)||{nom:id,icon:'💰'}}
+function isCulte(d){if(!d)return true;return JOURS_CULTE.includes(new Date(d+'T12:00:00').getDay())}
+function hasAccess(caisseId){if(!currentUser)return false;if(currentUser.role==='admin')return true;return(currentUser.caisses||[]).includes(caisseId)}
+function getSolde(id){
+  const e=_cache.entrees.filter(x=>x.caisse===id).reduce((a,x)=>a+Number(x.montant),0);
+  const s=_cache.sorties.filter(x=>x.caisse===id).reduce((a,x)=>a+Number(x.montant),0);
+  return{entrees:e,sorties:s,solde:e-s};
+}
+function getActiveCol(type){
+  if(window._activeCollections) return window._activeCollections[type];
+  const eid=window._currentEgliseId;
+  return type==='members'?`cl_members_${eid}`:type==='entrees'?`cl_entrees_${eid}`:type==='sorties'?`cl_sorties_${eid}`:`cl_notes_${eid}`;
+}
+function toast(msg,type='ok'){const t=document.getElementById('toast');t.textContent=msg;t.className='on '+type;setTimeout(()=>t.className='',2800)}
+function openModal(id){document.getElementById(id).classList.add('on')}
+function closeModal(id){document.getElementById(id).classList.remove('on')}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ÉCRAN D'ACCUEIL MULTI-ÉGLISE
+// ═══════════════════════════════════════════════════════════════════════════
+
+function wGoStep(stepId){
+  document.querySelectorAll('.wstep').forEach(s=>s.classList.remove('on'));
+  document.getElementById(stepId).classList.add('on');
+  if(stepId==='wStep2') loadEglisesStep2();
+}
+
+function wGoJyvos(){
+  wGoStep('wStepJyvos');
+  setTimeout(()=>document.getElementById('wJyvosPin').focus(),100);
+}
+
+async function loadEglisesStep2(){
+  const list=document.getElementById('wEgliseList');
+  list.innerHTML='<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px">Chargement…</div>';
+  try {
+    _eglisesList = await window.findEglises();
+    renderEglisesStep2();
+  } catch(e){
+    list.innerHTML='<div style="text-align:center;padding:20px;color:var(--red);font-size:12px">Erreur de connexion. Vérifiez votre réseau.</div>';
+  }
+}
+
+function renderEglisesStep2(){
+  const search=(document.getElementById('wSearchEglise')?.value||'').toLowerCase();
+  const list=document.getElementById('wEgliseList');
+  let eglises=_eglisesList.filter(e=>e.statut==='actif'||e.statut==='en_attente');
+  if(search) eglises=eglises.filter(e=>(e.nom||'').toLowerCase().includes(search)||(e.ville||'').toLowerCase().includes(search));
+  if(!eglises.length){
+    list.innerHTML='<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px">Aucune église trouvée.</div>';
+    return;
+  }
+  list.innerHTML=eglises.map(e=>`
+    <div class="eglise-select-item" onclick="selectionnerEglise('${e.id}')">
+      <span style="font-size:24px">⛪</span>
+      <div style="flex:1;min-width:0">
+        <div class="esi-nom">${e.nom}</div>
+        <div class="esi-ville">📍 ${e.ville||'—'} · Pasteur ${e.pasteur||'—'}</div>
+      </div>
+      <span class="esi-badge ${e.statut==='actif'?'badge-actif':'badge-attente'}">${e.statut==='actif'?'ACTIF':'EN ATTENTE'}</span>
+    </div>
+  `).join('');
+}
+
+function filterEglises(){
+  renderEglisesStep2();
+}
+
+async function selectionnerEglise(egliseId){
+  const eglise=_eglisesList.find(e=>e.id===egliseId);
+  if(!eglise){document.getElementById('wErrStep2').textContent='Église introuvable.';return;}
+  if(eglise.statut==='en_attente'){
+    document.getElementById('wErrStep2').textContent='⏳ Cette église est en attente de validation par JYVOS. Patientez.';
+    return;
+  }
+  if(eglise.statut==='suspendu'){
+    document.getElementById('wErrStep2').textContent='🚫 Cette église est suspendue. Contactez JYVOS.';
+    return;
+  }
+  document.getElementById('wErrStep2').textContent='';
+  // Stocker l'église sélectionnée
+  window._currentEgliseId=egliseId;
+  window._currentEglise=eglise;
+  localStorage.setItem('cl_eglise_id', egliseId);
+  // Charger les données de cette église
+  document.getElementById('wEgliseList').innerHTML='<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px">Connexion à '+eglise.nom+'…</div>';
+  try {
+    await window.loadFirestoreData(egliseId);
+    afficherLoginMembres(eglise);
+  } catch(e){
+    document.getElementById('wErrStep2').textContent='Erreur de chargement. Réessayez.';
+  }
+}
+
+function afficherLoginMembres(eglise){
+  document.getElementById('welcomeScreen').style.display='none';
+  document.getElementById('loginScreen').style.display='flex';
+  document.getElementById('loginEgliseName').textContent='⛪ '+eglise.nom;
+  buildLoginSelect();
+  // Tenter auto-login
+  tryAutoLogin();
+}
+
+async function soumettreInscription(){
+  const nom=document.getElementById('wiNom').value.trim();
+  const pasteur=document.getElementById('wiPasteur').value.trim();
+  const ville=document.getElementById('wiVille').value.trim();
+  const email=document.getElementById('wiEmail').value.trim();
+  const contact=document.getElementById('wiContact').value.trim();
+  const errEl=document.getElementById('wErrInscription');
+  if(!nom||!pasteur||!ville){errEl.textContent='Nom, pasteur et ville sont obligatoires.';return;}
+  errEl.textContent='';
+  const btn=document.querySelector('#wStepInscription .wbtn.pri');
+  if(btn){btn.textContent='Envoi…';btn.disabled=true;}
+  try {
+    const result=await window.inscrireEglise({nom,pasteur,ville,email,contact});
+    if(result){
+      document.getElementById('wInscriptionForm').style.display='none';
+      document.getElementById('wInscriptionOk').style.display='';
+    } else {
+      errEl.textContent='Erreur lors de l\'envoi. Réessayez.';
+    }
+  } catch(e){
+    errEl.textContent='Erreur réseau. Vérifiez votre connexion.';
+  }
+  if(btn){btn.textContent='Soumettre la demande';btn.disabled=false;}
+}
+
+function checkJyvosPin(){
+  const pin=document.getElementById('wJyvosPin').value;
+  if(pin===JYVOS_CODE){
+    document.getElementById('welcomeScreen').style.display='none';
+    ouvrirJyvosPanel();
+  } else {
+    document.getElementById('wErrJyvos').textContent='Code incorrect.';
+    document.getElementById('wJyvosPin').value='';
+  }
+}
+
+function changerEglise(){
+  currentUser=null;currentCaisse=null;
+  window._currentEgliseId=null;window._currentEglise=null;
+  _cache.members=[];_cache.entrees=[];_cache.sorties=[];_cache.notes=[];_cache.ready=false;
+  localStorage.removeItem('cl_session_id');localStorage.removeItem('cl_eglise_id');
+  document.getElementById('app').classList.remove('on');
+  document.getElementById('loginScreen').style.display='none';
+  document.getElementById('welcomeScreen').style.display='flex';
+  wGoStep('wStep1');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PANNEAU JYVOS ADMIN
+// ═══════════════════════════════════════════════════════════════════════════
+
+let _jyvosEglises=[];
+
+async function ouvrirJyvosPanel(){
+  document.getElementById('jyvosPanel').classList.add('on');
+  await jyvosRefresh();
+}
+
+async function jyvosRefresh(){
+  try {
+    _jyvosEglises=await window.loadEglises();
+    const total=_jyvosEglises.length;
+    const actives=_jyvosEglises.filter(e=>e.statut==='actif').length;
+    const attente=_jyvosEglises.filter(e=>e.statut==='en_attente').length;
+    const suspendues=_jyvosEglises.filter(e=>e.statut==='suspendu').length;
+    document.getElementById('jsTotal').textContent=total;
+    document.getElementById('jsActives').textContent=actives;
+    document.getElementById('jsAttente').textContent=attente;
+    document.getElementById('jsSuspendues').textContent=suspendues;
+    renderJyvosTable();
+  } catch(e){
+    console.error('Jyvos refresh error:',e);
+  }
+}
+
+function renderJyvosTable(){
+  const search=(document.getElementById('jySearch')?.value||'').toLowerCase();
+  let eglises=_jyvosEglises;
+  if(search) eglises=eglises.filter(e=>(e.nom||'').toLowerCase().includes(search)||(e.ville||'').toLowerCase().includes(search)||(e.pasteur||'').toLowerCase().includes(search));
+  eglises.sort((a,b)=>{
+    const order={en_attente:0,actif:1,suspendu:2};
+    return(order[a.statut]||1)-(order[b.statut]||1);
+  });
+  const tbody=document.getElementById('jyTableBody');
+  if(!eglises.length){tbody.innerHTML='<tr><td colspan="7" style="text-align:center;color:rgba(255,255,255,.3);padding:24px">Aucune église</td></tr>';return;}
+  tbody.innerHTML=eglises.map(e=>{
+    const badgeClass=e.statut==='actif'?'badge-actif':e.statut==='suspendu'?'badge-suspendu':'badge-attente';
+    const badgeLabel=e.statut==='actif'?'✅ Actif':e.statut==='suspendu'?'🚫 Suspendu':'⏳ En attente';
+    const dateInsc=e.dateInscription?new Date(e.dateInscription).toLocaleDateString('fr-FR'):'—';
+    return`<tr>
+      <td style="font-weight:700">⛪ ${e.nom||'—'}</td>
+      <td>${e.pasteur||'—'}</td>
+      <td>📍 ${e.ville||'—'}</td>
+      <td style="font-size:11px;color:rgba(255,255,255,.6)">${e.email||e.contact||'—'}</td>
+      <td style="font-size:11px;color:rgba(255,255,255,.5)">${dateInsc}</td>
+      <td><span class="esi-badge ${badgeClass}">${badgeLabel}</span></td>
+      <td>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${e.statut!=='actif'?`<button class="jy-btn activer" onclick="jyvosValider('${e.id}')">✅ Valider</button>`:''}
+          ${e.statut==='actif'?`<button class="jy-btn suspendre" onclick="jyvosSuspendre('${e.id}')">🚫 Suspendre</button>`:''}
+          <button class="jy-btn voir" onclick="jyvosVoir('${e.id}')">👁 Voir</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function jyvosValider(egliseId){
+  if(!confirm('Valider et activer cette église ?'))return;
+  const ok=await window.validerEglise(egliseId);
+  if(ok){toast('✅ Église activée','ok');await jyvosRefresh();}
+  else toast('Erreur lors de la validation','err');
+}
+
+async function jyvosSuspendre(egliseId){
+  if(!confirm('Suspendre cette église ? Elle ne pourra plus se connecter.'))return;
+  const ok=await window.suspendreEglise(egliseId);
+  if(ok){toast('🚫 Église suspendue','warn');await jyvosRefresh();}
+  else toast('Erreur','err');
+}
+
+function jyvosVoir(egliseId){
+  const e=_jyvosEglises.find(x=>x.id===egliseId);
+  if(!e)return;
+  alert(`Église : ${e.nom}\nPasteur : ${e.pasteur}\nVille : ${e.ville}\nEmail : ${e.email||'—'}\nContact : ${e.contact||'—'}\nStatut : ${e.statut}\nID : ${e.id}`);
+}
+
+function fermerJyvos(){
+  document.getElementById('jyvosPanel').classList.remove('on');
+  document.getElementById('welcomeScreen').style.display='flex';
+  wGoStep('wStep1');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SYNC HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function addToFS(type, item) {
+  const col = getActiveCol(type);
+  const eid = window._currentEgliseId;
+  const idbItem = { ...item, _eid: eid };
+  // Toujours sauvegarder en IDB d'abord
+  if (window._idbPut) await window._idbPut(type, idbItem);
+  if (!col) return;
+  if (navigator.onLine) {
+    try { await window.fsSet(col, item.id, item); return; } catch(e) {}
+  }
+  // Hors ligne : mettre en file d'attente
+  if (window._addPending) await window._addPending({ action: 'set', col, id2: item.id, data: item });
+}
+
+async function delFromFS(type, id) {
+  const col = getActiveCol(type);
+  // Supprimer de IDB
+  if (window._idbDel) await window._idbDel(type, id);
+  if (!col) return;
+  if (navigator.onLine) {
+    try { await window.fsDel(col, id); return; } catch(e) {}
+  }
+  if (window._addPending) await window._addPending({ action: 'del', col, id2: id });
+}
+
+async function updateInFS(type, id, data) {
+  const col = getActiveCol(type);
+  const eid = window._currentEgliseId;
+  if (window._idbPut) await window._idbPut(type, { ...data, _eid: eid });
+  if (!col || !id || !data) return;
+  if (navigator.onLine) {
+    try { await window.fsSet(col, id, data); return; } catch(e) {}
+  }
+  if (window._addPending) await window._addPending({ action: 'set', col, id2: id, data });
+}
+
+async function syncFS(type, arr) {
+  const col = getActiveCol(type);
+  const eid = window._currentEgliseId;
+  // Mise à jour IDB
+  if (window._idbClear && window._idbPutAll) {
+    const items = arr.map(x => ({ ...x, _eid: eid }));
+    await window._idbClear(type);
+    if (items.length) await window._idbPutAll(type, items);
+  }
+  if (!window.fsBatch || !window.fsGetAll || !col) return;
+  if (!navigator.onLine) {
+    // Mettre tout en file
+    if (window._addPending) {
+      for (const item of arr) await window._addPending({ action: 'set', col, id2: item.id, data: item });
+    }
+    return;
+  }
+  try {
+    const existing = await window.fsGetAll(col);
+    const newIds = new Set(arr.map(x => x.id || x));
+    const ops = [];
+    arr.forEach(item => { if (item.id) ops.push({ type: 'set', col, id: item.id, data: item }); });
+    existing.forEach(d => { if (!newIds.has(d.id)) ops.push({ type: 'del', col, id: d.id }); });
+    if (ops.length > 0) await window.fsBatch(ops);
+  } catch(e) { console.error('syncFS', col, e); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOGIN / LOGOUT
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildLoginSelect(){
+  const sel=document.getElementById('lsel');sel.innerHTML='';
+  _cache.members.forEach(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=m.nom+(m.statut==='bloque'?' (bloqué)':'');o.disabled=m.statut==='bloque';sel.appendChild(o)});
+}
+
+async function doLogin(){
+  const sid=document.getElementById('lsel').value;
+  const pin=document.getElementById('lpin').value;
+  const lbtn=document.querySelector('.lbtn');
+  if(lbtn){lbtn.textContent='Chargement…';lbtn.disabled=true;}
+  if(!_cache.ready){
+    try {
+      if(window.loadFirestoreData&&window._currentEgliseId) await window.loadFirestoreData(window._currentEgliseId);
+    } catch(e){
+      console.error('Erreur Firestore:',e);
+      toast('⚠️ Mode hors ligne','warn');
+    }
+    buildLoginSelect();
+  }
+  if(lbtn){lbtn.textContent='SE CONNECTER';lbtn.disabled=false;}
+  const user=_cache.members.find(m=>m.id===sid);
+  if(!user){document.getElementById('lerr').textContent='Compte introuvable.';return}
+  if(user.statut==='bloque'){document.getElementById('lerr').textContent='Accès bloqué par l\'administrateur.';return}
+  if(user.pin!==pin){document.getElementById('lerr').textContent='Code PIN incorrect.';return}
+  connecterUser(user);
+}
+
+function connecterUser(user){
+  currentUser=user;
+  document.getElementById('loginScreen').style.display='none';
+  document.getElementById('app').classList.add('on');
+  document.getElementById('tbAvt').textContent=user.nom.charAt(0).toUpperCase();
+  document.getElementById('tbNom').textContent=user.nom;
+  document.getElementById('tbRole').textContent=user.role==='admin'?'Admin':'Membre';
+  document.getElementById('navMembres').style.display=user.role==='admin'?'':'none';
+  document.getElementById('topEgliseName').textContent=window._currentEglise?window._currentEglise.nom:'';
+  document.getElementById('lpin').value='';
+  document.getElementById('lerr').textContent='';
+  localStorage.setItem('cl_session_id', user.id);
+  populateSelects();buildDashboard();
+  updateConnectStatus();
+}
+
+function doLogout(){
+  currentUser=null;currentCaisse=null;
+  localStorage.removeItem('cl_session_id');
+  document.getElementById('app').classList.remove('on');
+  document.getElementById('loginScreen').style.display='flex';
+  document.getElementById('lerr').textContent='';
+  buildLoginSelect();
+}
+
+async function tryAutoLogin(){
+  const savedId=localStorage.getItem('cl_session_id');
+  if(!savedId)return false;
+  if(!_cache.ready&&window.loadFirestoreData&&window._currentEgliseId){
+    try{ await window.loadFirestoreData(window._currentEgliseId); }catch(e){}
+  }
+  buildLoginSelect();
+  const user=_cache.members.find(m=>m.id===savedId);
+  if(!user||user.statut==='bloque'){localStorage.removeItem('cl_session_id');return false;}
+  connecterUser(user);
+  return true;
+}
+
+function updateConnectStatus(){
+  const el=document.getElementById('connectStatus');
+  const lbl=document.getElementById('connectLabel');
+  if(!el||!lbl)return;
+  const online=navigator.onLine;
+  el.className='tconnect '+(online?'online':'offline');
+  lbl.textContent=online?'EN LIGNE':'HORS LIGNE';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NAVIGATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+function nav(sec,btn){
+  document.querySelectorAll('.sec').forEach(s=>s.classList.remove('on'));
+  document.querySelectorAll('.nbtn').forEach(b=>b.classList.remove('on'));
+  document.getElementById('sec-'+sec).classList.add('on');btn.classList.add('on');
+  if(sec==='dashboard')buildDashboard();
+  else if(sec==='caisses'){retourCaisses();buildCaisses();}
+  else if(sec==='entrees')renderEntrees();
+  else if(sec==='sorties')renderSorties();
+  else if(sec==='beneficiaires')renderBenef();
+  else if(sec==='rapports')initRapport();
+  else if(sec==='params')initParams();
+  else if(sec==='notes')renderNotes();
+  else if(sec==='membres')renderMembres();
+}
+
+function populateSelects(){
+  ['filtECaisse','filtSCaisse','filtBCaisse'].forEach(id=>{
+    const s=document.getElementById(id);if(!s)return;
+    s.innerHTML='<option value="">Toutes les caisses</option>';
+    CAISSES.filter(c=>hasAccess(c.id)).forEach(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.icon+' '+c.nom;s.appendChild(o)});
+  });
+  ['eCaisse','sCaisse','eCaisseM','sCaisseM'].forEach(id=>{
+    const s=document.getElementById(id);if(!s)return;s.innerHTML='';
+    CAISSES.filter(c=>hasAccess(c.id)).forEach(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.icon+' '+c.nom;s.appendChild(o)});
+  });
+  ['eeC','esC'].forEach(id=>{
+    const s=document.getElementById(id);if(!s)return;s.innerHTML='';
+    CAISSES.forEach(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.icon+' '+c.nom;s.appendChild(o)});
+  });
+  const sa=document.getElementById('filtBAnnee');
+  if(sa){const ann=[...new Set([..._cache.entrees,..._cache.sorties].map(x=>x.date.slice(0,4)))].sort().reverse();sa.innerHTML='<option value="">Toutes les années</option>';ann.forEach(a=>{const o=document.createElement('option');o.value=a;o.textContent=a;sa.appendChild(o)});}
+  const cc=document.getElementById('mCaissesCheck');
+  if(cc)cc.innerHTML=CAISSES.map(c=>`<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer;background:var(--bg3);padding:5px 10px;border-radius:6px;border:1px solid var(--border)"><input type="checkbox" name="mcaisse" value="${c.id}" style="accent-color:var(--gold)">${c.icon} ${c.nom}</label>`).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildDashboard(){
+  const now=new Date();
+  document.getElementById('dDate').textContent=JOURS[now.getDay()]+' '+now.getDate()+' '+MOIS[now.getMonth()]+' '+now.getFullYear();
+  const allE=_cache.entrees.filter(e=>hasAccess(e.caisse));
+  const allS=_cache.sorties.filter(s=>hasAccess(s.caisse));
+  const te=allE.reduce((a,e)=>a+Number(e.montant),0);
+  const ts=allS.reduce((a,s)=>a+Number(s.montant),0);
+  document.getElementById('dStats').innerHTML=`
+    <div class="scard green"><div class="sl">Total Entrées</div><div class="sv g">${fmtS(te)} FCFA</div><div class="si">📥</div></div>
+    <div class="scard red"><div class="sl">Total Sorties</div><div class="sv r">${fmtS(ts)} FCFA</div><div class="si">📤</div></div>
+    <div class="scard gold"><div class="sl">Solde Global</div><div class="sv ${te-ts>=0?'g':'r'}">${fmtS(te-ts)} FCFA</div><div class="si">💰</div></div>
+    <div class="scard blue"><div class="sl">Transactions</div><div class="sv b">${allE.length+allS.length}</div><div class="si">📋</div></div>
+    <div class="scard gold"><div class="sl">Bénéficiaires</div><div class="sv gold">${[...new Set(allS.map(s=>s.destinataire))].filter(Boolean).length}</div><div class="si">👥</div></div>
+    <div class="scard blue"><div class="sl">Membres</div><div class="sv b">${_cache.members.length}</div><div class="si">🔑</div></div>`;
+  document.getElementById('dCaisses').innerHTML=CAISSES.map(c=>{
+    const s=getSolde(c.id);
+    return`<div onclick="ouvrirCaisse('${c.id}')" style="background:#fff;border:1px solid var(--border);border-radius:var(--r);padding:12px;cursor:pointer;transition:all .2s;text-align:center;box-shadow:var(--sh);border-top:3px solid ${s.solde>=0?'var(--green)':'var(--red)'}" onmouseover="this.style.borderColor='var(--gold2)'" onmouseout="this.style.borderColor='var(--border)'">
+      <div style="font-size:22px;margin-bottom:5px">${c.icon}</div>
+      <div style="font-size:10px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">${c.nom}</div>
+      <div style="font-family:'Barlow Condensed','Arial Narrow','Segoe UI',Arial,sans-serif;font-size:14px;font-weight:700;color:${s.solde>=0?'var(--green)':'var(--red)'}">${fmtS(s.solde)} FCFA</div>
+    </div>`;
+  }).join('');
+  const trans=[...allE.map(e=>({...e,_t:'e',_who:e.par||'—',_lbl:e.donateur||e.commentaire||'—'})),...allS.map(s=>({...s,_t:'s',_who:s.delivre||'—',_lbl:s.destinataire}))].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,12);
+  document.getElementById('dTrans').innerHTML=trans.length?trans.map(t=>`<tr>
+    <td style="font-weight:600">${dFR(t.date)}</td>
+    <td><span class="bdg ${t._t==='e'?'g':'r'}">${t._t==='e'?'Entrée':'Sortie'}</span></td>
+    <td><span class="bdg gold">${getCaisse(t.caisse).icon} ${getCaisse(t.caisse).nom}</span></td>
+    <td style="color:var(--text2)">${t._lbl}</td>
+    <td class="tamt ${t._t==='e'?'g':'r'}">${t._t==='e'?'+':'-'}${fmtS(t.montant)}</td>
+    <td style="color:var(--text3);font-size:11px">${t._who}</td>
+  </tr>`).join(''):`<tr><td colspan="6"><div class="empty"><div class="ei">📊</div><p>Aucune transaction</p></div></td></tr>`;
+  setTimeout(()=>{drawBar();drawDonut()},50);
+}
+
+function drawBar(){
+  const c=document.getElementById('chartBar');if(!c)return;
+  const ctx=c.getContext('2d');const now=new Date();
+  const labs=[],dE=[],dS=[];
+  for(let i=5;i>=0;i--){const d=new Date(now.getFullYear(),now.getMonth()-i,1);const y=d.getFullYear();const m=String(d.getMonth()+1).padStart(2,'0');labs.push(MOIS[d.getMonth()].slice(0,3));dE.push(_cache.entrees.filter(e=>e.date.startsWith(`${y}-${m}`)).reduce((a,e)=>a+Number(e.montant),0));dS.push(_cache.sorties.filter(s=>s.date.startsWith(`${y}-${m}`)).reduce((a,s)=>a+Number(s.montant),0));}
+  const W=c.offsetWidth||400,H=c.offsetHeight||170;c.width=W;c.height=H;ctx.clearRect(0,0,W,H);
+  const mx=Math.max(...dE,...dS,1);const pl=44,pr=10,pt=10,pb=28;
+  const bw=Math.max(6,Math.floor((W-pl-pr)/(labs.length*2.6)));const gp=Math.floor(bw*.4);const gw=bw*2+gp;
+  const sx=pl+(W-pl-pr-gw*labs.length)/2;const ch=H-pt-pb;
+  ctx.strokeStyle='rgba(0,0,0,0.06)';ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){const y=pt+ch*(1-i/4);ctx.beginPath();ctx.moveTo(pl,y);ctx.lineTo(W-pr,y);ctx.stroke();ctx.fillStyle='rgba(90,80,60,.6)';ctx.font='9px sans-serif';ctx.textAlign='right';ctx.fillText(fmtS(mx*i/4),pl-4,y+3);}
+  labs.forEach((lb,i)=>{const gx=sx+i*gw;const hE=Math.max(2,dE[i]/mx*ch),hS=Math.max(2,dS[i]/mx*ch);ctx.fillStyle='rgba(26,122,58,.75)';ctx.fillRect(gx,pt+ch-hE,bw,hE);ctx.fillStyle='rgba(192,57,43,.75)';ctx.fillRect(gx+bw+gp,pt+ch-hS,bw,hS);ctx.fillStyle='rgba(90,80,60,.7)';ctx.font='9px sans-serif';ctx.textAlign='center';ctx.fillText(lb,gx+bw,H-pb+12);});
+  ctx.fillStyle='rgba(26,122,58,.7)';ctx.fillRect(pl,H-12,10,8);ctx.fillStyle='rgba(90,80,60,.8)';ctx.font='9px sans-serif';ctx.textAlign='left';ctx.fillText('Entrées',pl+13,H-5);
+  ctx.fillStyle='rgba(192,57,43,.7)';ctx.fillRect(pl+65,H-12,10,8);ctx.fillText('Sorties',pl+78,H-5);
+}
+
+function drawDonut(){
+  const c=document.getElementById('chartDonut');if(!c)return;
+  const ctx=c.getContext('2d');const W=c.offsetWidth||300,H=c.offsetHeight||170;c.width=W;c.height=H;ctx.clearRect(0,0,W,H);
+  const data=CAISSES.map(ca=>({nom:ca.nom.slice(0,10),v:Math.max(0,getSolde(ca.id).solde)}));
+  const tot=data.reduce((a,d)=>a+d.v,0);if(!tot){ctx.fillStyle='rgba(90,80,60,.4)';ctx.font='12px sans-serif';ctx.textAlign='center';ctx.fillText('Aucune donnée',W/2,H/2);return}
+  const cols=['#b8941f','#1a7a3a','#1a5276','#7d3c98','#c0392b','#d4ac0d','#1a8a5a','#6c3483'];
+  const cx=W*.38,cy=H/2,R=Math.min(cx,cy)*.82,r=R*.52;let ang=-Math.PI/2;
+  data.forEach((d,i)=>{if(!d.v)return;const sl=d.v/tot*Math.PI*2;ctx.beginPath();ctx.moveTo(cx,cy);ctx.arc(cx,cy,R,ang,ang+sl);ctx.closePath();ctx.fillStyle=cols[i%cols.length];ctx.fill();ang+=sl;});
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();
+  ctx.fillStyle='var(--gold)';ctx.font='bold 11px sans-serif';ctx.textAlign='center';ctx.fillText(fmtS(tot),cx,cy+4);
+  const lx=W*.66;let ly=H*.08;data.forEach((d,i)=>{if(!d.v||ly>H-10)return;ctx.fillStyle=cols[i%cols.length];ctx.fillRect(lx,ly,8,8);ctx.fillStyle='rgba(90,80,60,.8)';ctx.font='9px sans-serif';ctx.textAlign='left';ctx.fillText(d.nom,lx+12,ly+7);ly+=13;});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAISSES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildCaisses(){
+  document.getElementById('listeCaisses').style.display='';document.getElementById('detailCaisse').style.display='none';
+  document.getElementById('caissesGrid').innerHTML=CAISSES.filter(c=>hasAccess(c.id)).map(c=>{
+    const s=getSolde(c.id);const nb=[...new Set(_cache.sorties.filter(x=>x.caisse===c.id).map(x=>x.destinataire))].length;
+    return`<div class="caisse-card" onclick="ouvrirCaisse('${c.id}')">
+      <div class="cc-head"><span class="cc-icon">${c.icon}</span><div><div class="cc-nom">${c.nom.toUpperCase()}</div>${c.culte?`<div class="cc-badge"><span class="bdg am">Mer · Ven · Dim</span></div>`:''}</div></div>
+      <div class="cc-stats">
+        <div class="cc-stat"><div class="csl">Entrées</div><div class="csv" style="color:var(--green)">${fmtS(s.entrees)}</div></div>
+        <div class="cc-stat"><div class="csl">Sorties</div><div class="csv" style="color:var(--red)">${fmtS(s.sorties)}</div></div>
+        <div class="cc-stat"><div class="csl">Solde</div><div class="csv" style="color:${s.solde>=0?'var(--green)':'var(--red)'}">${fmtS(s.solde)}</div></div>
+      </div>
+      <div class="cc-foot"><span>📥 ${_cache.entrees.filter(e=>e.caisse===c.id).length} entrées</span><span>📤 ${_cache.sorties.filter(x=>x.caisse===c.id).length} sorties</span><span>👥 ${nb} bénéf.</span></div>
+      <div class="cc-hint">→ Cliquer pour voir toutes les transactions</div>
+    </div>`;
+  }).join('');
+}
+
+function retourCaisses(){currentCaisse=null;document.getElementById('listeCaisses').style.display='';document.getElementById('detailCaisse').style.display='none';}
+
+function ouvrirCaisse(caisseId){
+  document.querySelectorAll('.sec').forEach(s=>s.classList.remove('on'));
+  document.querySelectorAll('.nbtn').forEach(b=>b.classList.remove('on'));
+  document.getElementById('sec-caisses').classList.add('on');
+  document.querySelectorAll('.nbtn')[1].classList.add('on');
+  currentCaisse=caisseId;
+  const caisse=getCaisse(caisseId);
+  document.getElementById('listeCaisses').style.display='none';
+  document.getElementById('detailCaisse').style.display='';
+  document.getElementById('detailTitre').textContent=caisse.icon+' '+caisse.nom.toUpperCase();
+  document.getElementById('detailSub').textContent='Traçabilité complète — toutes les transactions de cette caisse';
+  const btnReinit=document.getElementById('btnReinit');
+  if(btnReinit)btnReinit.style.display=currentUser&&currentUser.role==='admin'?'':'none';
+  const s=getSolde(caisseId);
+  document.getElementById('detailStats').innerHTML=`
+    <div class="scard green"><div class="sl">Total Entrées</div><div class="sv g">${fmt(s.entrees)}</div><div class="si">📥</div></div>
+    <div class="scard red"><div class="sl">Total Sorties</div><div class="sv r">${fmt(s.sorties)}</div><div class="si">📤</div></div>
+    <div class="scard gold"><div class="sl">Solde actuel</div><div class="sv ${s.solde>=0?'g':'r'}">${fmt(s.solde)}</div><div class="si">💰</div></div>`;
+  renderDetailCaisse();
+}
+
+function renderDetailCaisse(){
+  if(!currentCaisse)return;
+  const dd=document.getElementById('filtCDateD')?.value||'';
+  const df=document.getElementById('filtCDateF')?.value||'';
+  const srch=(document.getElementById('filtCSearch')?.value||'').toLowerCase();
+  let E=_cache.entrees.filter(e=>e.caisse===currentCaisse);
+  let S=_cache.sorties.filter(s=>s.caisse===currentCaisse);
+  if(dd){E=E.filter(e=>e.date>=dd);S=S.filter(s=>s.date>=dd);}
+  if(df){E=E.filter(e=>e.date<=df);S=S.filter(s=>s.date<=df);}
+  const all=[...E.map(e=>({...e,_t:'e'})),...S.map(s=>({...s,_t:'s'}))].sort((a,b)=>b.date.localeCompare(a.date)||b.heure.localeCompare(a.heure));
+  const filtered=srch?all.filter(t=>(t.destinataire||t.donateur||t.motif||t.commentaire||'').toLowerCase().includes(srch)):all;
+  const isAdmin=currentUser&&currentUser.role==='admin';
+  const te=E.reduce((a,e)=>a+Number(e.montant),0);
+  const ts=S.reduce((a,s)=>a+Number(s.montant),0);
+  document.getElementById('detailTotal').innerHTML=`📥 Entrées : <strong style="color:var(--green)">${fmt(te)}</strong> &nbsp;·&nbsp; 📤 Sorties : <strong style="color:var(--red)">${fmt(ts)}</strong> &nbsp;·&nbsp; 💰 Solde : <strong style="color:${te-ts>=0?'var(--green)':'var(--red)'}">${fmt(te-ts)}</strong>`;
+  document.getElementById('detailTrans').innerHTML=filtered.length?filtered.map(t=>`<tr>
+    <td style="font-weight:600;white-space:nowrap">${dFR(t.date)}</td>
+    <td style="color:var(--text3);font-size:11px">${t.heure||'—'}</td>
+    <td><span class="bdg ${t._t==='e'?'g':'r'}">${t._t==='e'?'Entrée':'Sortie'}</span></td>
+    <td class="tamt ${t._t==='e'?'g':'r'}">${t._t==='e'?'+':'-'}${fmtS(t.montant)}</td>
+    <td>${t._t==='e'?((t.donateurTitre?t.donateurTitre+' ':'')+t.donateur||'—'):(t.destTitre?t.destTitre+' ':'')+t.destinataire||'—'}</td>
+    <td style="color:var(--text2);font-size:12px">${t._t==='e'?t.commentaire||'—':t.motif||'—'}</td>
+    <td style="color:var(--text3);font-size:11px">${t.par||'—'}</td>
+    <td class="no-print" style="white-space:nowrap">
+      ${isAdmin?`<button class="btn sec sm" onclick="${t._t==='e'?'openEditEntree':'openEditSortie'}('${t.id}')" style="margin-right:4px">✏️</button>`:''}
+      <button class="btn dan sm" onclick="${t._t==='e'?'delEntree':'delSortie'}('${t.id}')">🗑</button>
+    </td>
+  </tr>`).join(''):`<tr><td colspan="8"><div class="empty"><div class="ei">📂</div><p>Aucune transaction</p></div></td></tr>`;
+}
+
+function openModalReinit(){
+  if(!currentCaisse)return;
+  document.getElementById('reinitNom').textContent=getCaisse(currentCaisse).icon+' '+getCaisse(currentCaisse).nom;
+  document.getElementById('reinitPin').value='';
+  document.getElementById('reinitAlert').innerHTML='';
+  openModal('mReinit');
+}
+
+async function executeReinit(){
+  const pin=document.getElementById('reinitPin').value;
+  const alertEl=document.getElementById('reinitAlert');
+  const admin=_cache.members.find(m=>m.id===currentUser.id);
+  if(!admin||admin.pin!==pin){alertEl.innerHTML=`<div class="al err">❌ PIN incorrect.</div>`;return;}
+  const eid=currentCaisse;
+  _cache.entrees=_cache.entrees.filter(e=>e.caisse!==eid);
+  _cache.sorties=_cache.sorties.filter(s=>s.caisse!==eid);
+  await syncFS('entrees',_cache.entrees);
+  await syncFS('sorties',_cache.sorties);
+  closeModal('mReinit');
+  toast('✅ Caisse réinitialisée','ok');
+  ouvrirCaisse(eid);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTRÉES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function renderEntrees(){
+  const caisse=document.getElementById('filtECaisse')?.value||'';
+  const dd=document.getElementById('filtEDateD')?.value||'';
+  const df=document.getElementById('filtEDateF')?.value||'';
+  const srch=(document.getElementById('filtESearch')?.value||'').toLowerCase();
+  let E=_cache.entrees.filter(e=>hasAccess(e.caisse));
+  if(caisse)E=E.filter(e=>e.caisse===caisse);
+  if(dd)E=E.filter(e=>e.date>=dd);if(df)E=E.filter(e=>e.date<=df);
+  if(srch)E=E.filter(e=>(e.donateur||e.commentaire||'').toLowerCase().includes(srch));
+  E.sort((a,b)=>b.date.localeCompare(a.date)||b.heure.localeCompare(a.heure));
+  const te=E.reduce((a,e)=>a+Number(e.montant),0);
+  document.getElementById('entreesTotal').innerHTML=`${E.length} entrée(s) — Total : <strong style="color:var(--green)">${fmt(te)}</strong>`;
+  const isAdmin=currentUser&&currentUser.role==='admin';
+  document.getElementById('tEntrees').innerHTML=E.length?E.map(e=>`<tr>
+    <td style="font-weight:600;white-space:nowrap">${dFR(e.date)}</td>
+    <td style="color:var(--text3);font-size:11px">${e.heure||'—'}</td>
+    <td style="color:var(--text2)">${getJour(e.date)}</td>
+    <td><span class="bdg gold">${getCaisse(e.caisse).icon} ${getCaisse(e.caisse).nom}</span></td>
+    <td class="tamt g">+${fmtS(e.montant)}</td>
+    <td>${(e.donateurTitre?e.donateurTitre+' ':'')+e.donateur||'—'}</td>
+    <td style="color:var(--text2);font-size:12px">${e.commentaire||'—'}</td>
+    <td style="color:var(--text3);font-size:11px">${e.par||'—'}</td>
+    <td class="no-print" style="white-space:nowrap">
+      ${isAdmin?`<button class="btn sec sm" onclick="openEditEntree('${e.id}')" style="margin-right:4px">✏️</button>`:''}
+      <button class="btn dan sm" onclick="delEntree('${e.id}')">🗑</button>
+    </td>
+  </tr>`).join(''):`<tr><td colspan="9"><div class="empty"><div class="ei">📥</div><p>Aucune entrée</p></div></td></tr>`;
+}
+
+function openModalEntree(){
+  document.getElementById('mEntreeAlert').innerHTML='';
+  const today=new Date().toISOString().split('T')[0];
+  document.getElementById('eDate').value=today;
+  document.getElementById('eDateM').value=today;
+  document.getElementById('eMontant').value='';
+  document.getElementById('eDonateur').value='';
+  document.getElementById('eComment').value='';
+  if(currentCaisse){document.getElementById('eCaisse').value=currentCaisse;document.getElementById('eCaisseM').value=currentCaisse;}
+  setModeEntree('simple');
+  openModal('mEntree');
+}
+
+function setModeEntree(mode){
+  const isSimple=mode==='simple';
+  document.getElementById('eSimple').style.display=isSimple?'':'none';
+  document.getElementById('eMulti').style.display=isSimple?'none':'';
+  document.getElementById('eBtnSimple').className='btn '+(isSimple?'pri':'sec')+' sm';
+  document.getElementById('eBtnMulti').className='btn '+(isSimple?'sec':'pri')+' sm';
+  if(!isSimple&&!document.querySelectorAll('#eLignes tr').length)addLigneEntree();
+}
+
+function addLigneEntree(){
+  const tbody=document.getElementById('eLignes');
+  const n=tbody.rows.length+1;
+  const tr=document.createElement('tr');
+  tr.innerHTML=`<td style="color:var(--text3);font-size:12px;padding:6px 8px">${n}</td>
+    <td style="padding:4px 6px"><input type="number" class="em-montant" placeholder="0" min="0" style="width:110px;padding:7px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg3);outline:none" oninput="updateTotalEntree()"></td>
+    <td style="padding:4px 6px"><input type="text" class="em-don" placeholder="Nom" style="width:130px;padding:7px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg3);outline:none"></td>
+    <td style="padding:4px 6px"><input type="text" class="em-com" placeholder="Commentaire" style="width:160px;padding:7px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg3);outline:none" onkeydown="onLastFieldEntree(event,this)"></td>
+    <td style="padding:4px 6px"><button onclick="this.closest('tr').remove();reindexEntree();updateTotalEntree()" style="background:none;border:none;color:var(--red);font-size:14px;cursor:pointer">✕</button></td>`;
+  tbody.appendChild(tr);updateCompteurEntree();
+  setTimeout(()=>tr.querySelector('.em-montant').focus(),50);
+}
+function reindexEntree(){document.querySelectorAll('#eLignes tr').forEach((tr,i)=>{tr.cells[0].textContent=i+1;});}
+function clearLignesEntree(){document.getElementById('eLignes').innerHTML='';updateCompteurEntree();addLigneEntree();}
+function onLastFieldEntree(e,el){if(e.key==='Enter'){e.preventDefault();addLigneEntree();}}
+function updateTotalEntree(){const t=Array.from(document.querySelectorAll('.em-montant')).reduce((a,i)=>a+Number(i.value||0),0);document.getElementById('eTotalMulti').textContent=t?'Total : '+fmt(t):'';}
+function updateCompteurEntree(){document.getElementById('eCompteur').textContent=document.querySelectorAll('#eLignes tr').length+' ligne(s)';}
+
+async function saveEntreeSimple(){
+  const date=document.getElementById('eDate').value,caisse=document.getElementById('eCaisse').value;
+  if(!date||!caisse){document.getElementById('mEntreeAlert').innerHTML=`<div class="al err">❌ Date et caisse obligatoires.</div>`;return}
+  const montant=Number(document.getElementById('eMontant').value);
+  if(!montant){document.getElementById('mEntreeAlert').innerHTML=`<div class="al err">❌ Montant obligatoire.</div>`;return}
+  const don=document.getElementById('eDonateur').value.trim();
+  const donTitre=document.getElementById('eDonateurTitre').value||'';
+  const com=document.getElementById('eComment').value.trim();
+  const now=new Date();
+  const item={id:uid(),date,heure:now.toTimeString().slice(0,5),caisse,montant,donateur:don,donateurTitre:donTitre,commentaire:com,par:currentUser.nom};
+  _cache.entrees.push(item);
+  await addToFS('entrees',item);
+  closeModal('mEntree');toast('Entrée enregistrée ✓','ok');renderEntrees();if(currentCaisse)renderDetailCaisse();buildDashboard();
+}
+
+async function saveEntree(){
+  const date=document.getElementById('eDateM').value,caisse=document.getElementById('eCaisseM').value;
+  if(!date||!caisse){document.getElementById('mEntreeAlert').innerHTML=`<div class="al err">❌ Date et caisse obligatoires.</div>`;return}
+  const lignes=document.querySelectorAll('#eLignes tr');
+  const now=new Date();let saved=0,errors=[];
+  const items=[];
+  lignes.forEach((tr,i)=>{
+    const montant=Number(tr.querySelector('.em-montant').value);
+    const don=tr.querySelector('.em-don').value.trim();
+    const com=tr.querySelector('.em-com').value.trim();
+    if(!montant&&!don&&!com)return;
+    if(!montant){errors.push('Ligne '+(i+1)+' : montant manquant');return}
+    const item={id:uid(),date,heure:now.toTimeString().slice(0,5),caisse,montant,donateur:don,commentaire:com,par:currentUser.nom};
+    items.push(item);saved++;
+  });
+  if(errors.length){document.getElementById('mEntreeAlert').innerHTML=`<div class="al err">❌ ${errors.join(' | ')}</div>`;return}
+  if(!saved){document.getElementById('mEntreeAlert').innerHTML=`<div class="al err">❌ Saisissez au moins une entrée valide.</div>`;return}
+  items.forEach(item=>_cache.entrees.push(item));
+  await syncFS('entrees',_cache.entrees);
+  closeModal('mEntree');toast(saved>1?saved+' entrées enregistrées ✓':'Entrée enregistrée ✓','ok');renderEntrees();if(currentCaisse)renderDetailCaisse();buildDashboard();
+}
+
+function openEditEntree(id){
+  const e=_cache.entrees.find(x=>x.id===id);if(!e)return;
+  _editEntreeId=id;
+  document.getElementById('eeC').value=e.caisse;
+  document.getElementById('eeM').value=e.montant;
+  document.getElementById('eeD').value=e.donateur||'';
+  document.getElementById('eeCom').value=e.commentaire||'';
+  document.getElementById('mEditEntreeAlert').innerHTML='';
+  openModal('mEditEntree');
+}
+
+async function saveEditEntree(){
+  const e=_cache.entrees.find(x=>x.id===_editEntreeId);if(!e)return;
+  const caisse=document.getElementById('eeC').value;
+  const montant=Number(document.getElementById('eeM').value);
+  if(!caisse||!montant){document.getElementById('mEditEntreeAlert').innerHTML=`<div class="al err">❌ Caisse et montant obligatoires.</div>`;return;}
+  e.caisse=caisse;e.montant=montant;e.donateur=document.getElementById('eeD').value.trim();e.commentaire=document.getElementById('eeCom').value.trim();
+  await updateInFS('entrees',e.id,e);
+  closeModal('mEditEntree');toast('✅ Entrée modifiée','ok');renderEntrees();if(currentCaisse)renderDetailCaisse();buildDashboard();
+}
+
+async function delEntree(id){
+  if(!confirm('Supprimer cette entrée ?'))return;
+  _cache.entrees=_cache.entrees.filter(e=>e.id!==id);
+  await delFromFS('entrees',id);
+  renderEntrees();if(currentCaisse)renderDetailCaisse();toast('Supprimé','warn');buildDashboard();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SORTIES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function renderSorties(){
+  const caisse=document.getElementById('filtSCaisse')?.value||'';
+  const dd=document.getElementById('filtSDateD')?.value||'';
+  const df=document.getElementById('filtSDateF')?.value||'';
+  const srch=(document.getElementById('filtSSearch')?.value||'').toLowerCase();
+  let S=_cache.sorties.filter(s=>hasAccess(s.caisse));
+  if(caisse)S=S.filter(s=>s.caisse===caisse);
+  if(dd)S=S.filter(s=>s.date>=dd);if(df)S=S.filter(s=>s.date<=df);
+  if(srch)S=S.filter(s=>(s.destinataire||s.motif||'').toLowerCase().includes(srch));
+  S.sort((a,b)=>b.date.localeCompare(a.date)||b.heure.localeCompare(a.heure));
+  const ts=S.reduce((a,s)=>a+Number(s.montant),0);
+  document.getElementById('sortiesTotal').innerHTML=`${S.length} sortie(s) — Total : <strong style="color:var(--red)">${fmt(ts)}</strong>`;
+  const isAdmin=currentUser&&currentUser.role==='admin';
+  document.getElementById('tSorties').innerHTML=S.length?S.map(s=>`<tr>
+    <td style="font-weight:600;white-space:nowrap">${dFR(s.date)}</td>
+    <td style="color:var(--text3);font-size:11px">${s.heure||'—'}</td>
+    <td style="color:var(--text2)">${getJour(s.date)}</td>
+    <td><span class="bdg gold">${getCaisse(s.caisse).icon} ${getCaisse(s.caisse).nom}</span></td>
+    <td>${(s.destTitre?s.destTitre+' ':'')+s.destinataire||'—'}</td>
+    <td class="tamt r">-${fmtS(s.montant)}</td>
+    <td style="color:var(--text2);font-size:12px">${s.motif||'—'}</td>
+    <td style="color:var(--text3);font-size:11px">${s.justif||'—'}</td>
+    <td style="color:var(--text3);font-size:11px">${s.delivre||s.par||'—'}</td>
+    <td class="no-print" style="white-space:nowrap">
+      ${isAdmin?`<button class="btn sec sm" onclick="openEditSortie('${s.id}')" style="margin-right:4px">✏️</button>`:''}
+      <button class="btn dan sm" onclick="delSortie('${s.id}')">🗑</button>
+    </td>
+  </tr>`).join(''):`<tr><td colspan="10"><div class="empty"><div class="ei">📤</div><p>Aucune sortie</p></div></td></tr>`;
+}
+
+function openModalSortie(){
+  document.getElementById('mSortieAlert').innerHTML='';
+  const today=new Date().toISOString().split('T')[0];
+  document.getElementById('sDate').value=today;
+  document.getElementById('sDateM').value=today;
+  document.getElementById('sMontant').value='';
+  document.getElementById('sDest').value='';
+  document.getElementById('sDelivre').value='';
+  document.getElementById('sMotif').value='';
+  document.getElementById('sJustif').value='';
+  document.getElementById('sLignes').innerHTML='';
+  if(currentCaisse){document.getElementById('sCaisse').value=currentCaisse;document.getElementById('sCaisseM').value=currentCaisse;}
+  setModeSortie('simple');
+  openModal('mSortie');
+}
+
+function setModeSortie(mode){
+  const isSimple=mode==='simple';
+  document.getElementById('sSortieSimple').style.display=isSimple?'':'none';
+  document.getElementById('sSortieMulti').style.display=isSimple?'none':'';
+  document.getElementById('sBtnSimple').className='btn '+(isSimple?'pri':'sec')+' sm';
+  document.getElementById('sBtnMulti').className='btn '+(isSimple?'sec':'pri')+' sm';
+  if(!isSimple&&!document.querySelectorAll('#sLignes tr').length)addLigneSortie();
+}
+
+function addLigneSortie(){
+  const tbody=document.getElementById('sLignes');
+  const n=tbody.rows.length+1;
+  const tr=document.createElement('tr');
+  tr.innerHTML=`<td style="color:var(--text3);font-size:12px;padding:6px 8px">${n}</td>
+    <td style="padding:4px 6px"><input type="number" class="sm-montant" placeholder="0" min="0" style="width:100px;padding:7px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg3);outline:none" oninput="updateTotalSortie()"></td>
+    <td style="padding:4px 6px"><input type="text" class="sm-dest" placeholder="Nom" style="width:120px;padding:7px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg3);outline:none"></td>
+    <td style="padding:4px 6px"><input type="text" class="sm-delivre" placeholder="Responsable" style="width:120px;padding:7px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg3);outline:none"></td>
+    <td style="padding:4px 6px"><input type="text" class="sm-motif" placeholder="Motif" style="width:130px;padding:7px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg3);outline:none"></td>
+    <td style="padding:4px 6px"><input type="text" class="sm-justif" placeholder="Justification" style="width:150px;padding:7px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg3);outline:none" onkeydown="onLastFieldSortie(event,this)"></td>
+    <td style="padding:4px 6px"><button onclick="this.closest('tr').remove();reindexSortie();updateTotalSortie()" style="background:none;border:none;color:var(--red);font-size:14px;cursor:pointer">✕</button></td>`;
+  tbody.appendChild(tr);updateCompteurSortie();
+  setTimeout(()=>tr.querySelector('.sm-montant').focus(),50);
+}
+function reindexSortie(){document.querySelectorAll('#sLignes tr').forEach((tr,i)=>{tr.cells[0].textContent=i+1;});}
+function clearLignesSortie(){document.getElementById('sLignes').innerHTML='';updateCompteurSortie();addLigneSortie();}
+function onLastFieldSortie(e,el){if(e.key==='Enter'){e.preventDefault();addLigneSortie();}}
+function updateTotalSortie(){const t=Array.from(document.querySelectorAll('.sm-montant')).reduce((a,i)=>a+Number(i.value||0),0);document.getElementById('sTotalMulti').textContent=t?'Total : '+fmt(t):'';}
+function updateCompteurSortie(){document.getElementById('sCompteur').textContent=document.querySelectorAll('#sLignes tr').length+' ligne(s)';}
+
+async function saveSortieSimple(){
+  const date=document.getElementById('sDate').value,caisse=document.getElementById('sCaisse').value;
+  if(!date||!caisse){document.getElementById('mSortieAlert').innerHTML=`<div class="al err">❌ Date et caisse obligatoires.</div>`;return}
+  const montant=Number(document.getElementById('sMontant').value);
+  if(!montant){document.getElementById('mSortieAlert').innerHTML=`<div class="al err">❌ Montant obligatoire.</div>`;return}
+  const dest=document.getElementById('sDest').value.trim();
+  const destTitre=document.getElementById('sDestTitre').value||'';
+  const delivre=document.getElementById('sDelivre').value.trim();
+  const motif=document.getElementById('sMotif').value.trim();
+  const justif=document.getElementById('sJustif').value.trim();
+  const now=new Date();
+  const item={id:uid(),date,heure:now.toTimeString().slice(0,5),caisse,montant,destinataire:dest,destTitre,motif,justif,delivre,par:currentUser.nom};
+  _cache.sorties.push(item);
+  await addToFS('sorties',item);
+  closeModal('mSortie');toast('Sortie enregistrée ✓','ok');renderSorties();if(currentCaisse)renderDetailCaisse();buildDashboard();
+}
+
+async function saveSortie(){
+  const date=document.getElementById('sDateM').value,caisse=document.getElementById('sCaisseM').value;
+  if(!date||!caisse){document.getElementById('mSortieAlert').innerHTML=`<div class="al err">❌ Date et caisse obligatoires.</div>`;return}
+  const lignes=document.querySelectorAll('#sLignes tr');
+  const now=new Date();let saved=0,errors=[];const items=[];
+  lignes.forEach((tr,i)=>{
+    const montant=Number(tr.querySelector('.sm-montant').value);
+    const dest=tr.querySelector('.sm-dest').value.trim();
+    const delivre=tr.querySelector('.sm-delivre').value.trim();
+    const motif=tr.querySelector('.sm-motif').value.trim();
+    const justif=tr.querySelector('.sm-justif').value.trim();
+    if(!montant&&!dest&&!motif)return;
+    if(!montant){errors.push('Ligne '+(i+1)+' : montant manquant');return}
+    items.push({id:uid(),date,heure:now.toTimeString().slice(0,5),caisse,montant,destinataire:dest,motif,justif,delivre,par:currentUser.nom});
+    saved++;
+  });
+  if(errors.length){document.getElementById('mSortieAlert').innerHTML=`<div class="al err">❌ ${errors.join(' | ')}</div>`;return}
+  if(!saved){document.getElementById('mSortieAlert').innerHTML=`<div class="al err">❌ Saisissez au moins une sortie valide.</div>`;return}
+  items.forEach(item=>_cache.sorties.push(item));
+  await syncFS('sorties',_cache.sorties);
+  closeModal('mSortie');toast(saved>1?saved+' sorties enregistrées ✓':'Sortie enregistrée ✓','ok');renderSorties();if(currentCaisse)renderDetailCaisse();buildDashboard();
+}
+
+function openEditSortie(id){
+  const s=_cache.sorties.find(x=>x.id===id);if(!s)return;
+  _editSortieId=id;
+  document.getElementById('esC').value=s.caisse;
+  document.getElementById('esM').value=s.montant;
+  document.getElementById('esD').value=s.destinataire||'';
+  document.getElementById('esMo').value=s.motif||'';
+  document.getElementById('esJ').value=s.justif||'';
+  document.getElementById('mEditSortieAlert').innerHTML='';
+  openModal('mEditSortie');
+}
+
+async function saveEditSortie(){
+  const s=_cache.sorties.find(x=>x.id===_editSortieId);if(!s)return;
+  const caisse=document.getElementById('esC').value;
+  const montant=Number(document.getElementById('esM').value);
+  if(!caisse||!montant){document.getElementById('mEditSortieAlert').innerHTML=`<div class="al err">❌ Caisse et montant obligatoires.</div>`;return;}
+  s.caisse=caisse;s.montant=montant;s.destinataire=document.getElementById('esD').value.trim();s.motif=document.getElementById('esMo').value.trim();s.justif=document.getElementById('esJ').value.trim();
+  await updateInFS('sorties',s.id,s);
+  closeModal('mEditSortie');toast('✅ Sortie modifiée','ok');renderSorties();if(currentCaisse)renderDetailCaisse();buildDashboard();
+}
+
+async function delSortie(id){
+  if(!confirm('Supprimer cette sortie ?'))return;
+  _cache.sorties=_cache.sorties.filter(s=>s.id!==id);
+  await delFromFS('sorties',id);
+  renderSorties();if(currentCaisse)renderDetailCaisse();toast('Supprimé','warn');buildDashboard();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BÉNÉFICIAIRES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function renderBenef(){
+  const caisse=document.getElementById('filtBCaisse')?.value||'';
+  const annee=document.getElementById('filtBAnnee')?.value||'';
+  const search=document.getElementById('filtBSearch')?.value.toLowerCase()||'';
+  let S=_cache.sorties.filter(s=>hasAccess(s.caisse));
+  if(caisse)S=S.filter(s=>s.caisse===caisse);if(annee)S=S.filter(s=>s.date.startsWith(annee));
+  const map={};S.forEach(s=>{const k=s.destinataire;if(!k)return;if(!map[k])map[k]={nom:k,entries:[],total:0,caisses:new Set()};map[k].entries.push(s);map[k].total+=Number(s.montant);map[k].caisses.add(s.caisse);});
+  let list=Object.values(map);if(search)list=list.filter(b=>b.nom.toLowerCase().includes(search));list.sort((a,b)=>b.entries.length-a.entries.length);
+  const c=document.getElementById('benefContent');
+  if(!list.length){c.innerHTML=`<div class="empty"><div class="ei">👥</div><p>Aucun bénéficiaire enregistré</p></div>`;return}
+  c.innerHTML=list.map(b=>{b.entries.sort((a,x)=>a.date.localeCompare(x.date));return`<div class="bcard">
+    <div class="bname">${b.nom}</div>
+    <div class="bstats"><div class="bst">Nb d'aides : <strong>${b.entries.length}</strong></div><div class="bst">Total reçu : <strong>${fmt(b.total)}</strong></div><div class="bst">Caisses : <strong>${[...b.caisses].map(cId=>getCaisse(cId).icon).join(' ')}</strong></div></div>
+    ${b.entries.map(e=>`<div class="bline"><span class="bdate">${dFR(e.date)}</span><span style="font-size:10px;color:var(--text3);min-width:60px">${getJour(e.date)}</span><span class="bamt">-${fmt(e.montant)}</span><span class="bcaisse">${getCaisse(e.caisse).icon} ${getCaisse(e.caisse).nom}</span><span class="bmotif">${e.motif||'—'}</span></div>`).join('')}
+  </div>`}).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RAPPORTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function initRapport(){
+  const now=new Date();
+  const st='padding:7px 11px;background:#fff;border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:12px;outline:none';
+  document.getElementById('rapportFiltDate').innerHTML=`<input type="date" id="rapportDate" onchange="buildRapport()" value="${now.toISOString().split('T')[0]}" style="${st}">`;
+  buildRapport();
+}
+
+function setRT(t){
+  rapportType=t;
+  const btns=['rtJour','rtMois','rtAnnee'];const types=['jour','mois','annee'];
+  btns.forEach((id,i)=>{const el=document.getElementById(id);if(!el)return;if(types[i]===t){el.style.background='var(--gold)';el.style.color='#fff';el.style.borderColor='var(--gold)';}else{el.style.background='#fff';el.style.color='var(--text2)';el.style.borderColor='var(--border)';}});
+  const now=new Date();const filt=document.getElementById('rapportFiltDate');
+  const st='padding:7px 11px;background:#fff;border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:12px;outline:none';
+  if(t==='jour'){filt.innerHTML='<input type="date" id="rapportDate" onchange="buildRapport()" style="'+st+'" value="'+now.toISOString().split('T')[0]+'">';}
+  else if(t==='mois'){const ym=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');filt.innerHTML='<input type="month" id="rapportDate" onchange="buildRapport()" style="'+st+'" value="'+ym+'">';}
+  else{const ann=[...new Set([..._cache.entrees,..._cache.sorties].map(x=>x.date.slice(0,4)))].sort().reverse();const y=now.getFullYear().toString();const opts=(ann.length?ann:[y]).map(a=>'<option value="'+a+'">'+a+'</option>').join('');filt.innerHTML='<select id="rapportDate" onchange="buildRapport()" style="'+st+'">'+opts+'</select>';}
+  setTimeout(buildRapport,50);
+}
+
+function buildRapport(){
+  const el=document.getElementById('rapportDate');const val=el?el.value:'';
+  const cont=document.getElementById('rapportContent');
+  if(!val){cont.innerHTML='<div class="al info">Sélectionnez une période.</div>';return}
+  if(rapportType==='jour')buildRJour(val,cont);
+  else if(rapportType==='mois')buildRMois(val,cont);
+  else buildRAnnee(val,cont);
+}
+
+function buildRJour(date,cont){
+  const E=_cache.entrees.filter(e=>e.date===date&&hasAccess(e.caisse));
+  const S=_cache.sorties.filter(s=>s.date===date&&hasAccess(s.caisse));
+  const te=E.reduce((a,e)=>a+Number(e.montant),0);
+  const ts=S.reduce((a,s)=>a+Number(s.montant),0);
+  const jourLabel=JOURS[new Date(date+'T12:00:00').getDay()]+' '+dFR(date);
+  const egliseName=window._currentEglise?window._currentEglise.nom:'';
+  cont.innerHTML=`<div class="rp-titre">${egliseName?egliseName+' — ':''} RAPPORT JOURNALIER</div>
+  <div class="rp-sub">${jourLabel}</div>
+  ${buildRapportBlock(jourLabel,E,S,te,ts,'jour')}`;
+}
+
+function buildRMois(ym,cont){
+  const [y,m]=ym.split('-');
+  const mLabel=MOIS[Number(m)-1]+' '+y;
+  const E=_cache.entrees.filter(e=>e.date.startsWith(ym)&&hasAccess(e.caisse));
+  const S=_cache.sorties.filter(s=>s.date.startsWith(ym)&&hasAccess(s.caisse));
+  const te=E.reduce((a,e)=>a+Number(e.montant),0);
+  const ts=S.reduce((a,s)=>a+Number(s.montant),0);
+  const egliseName=window._currentEglise?window._currentEglise.nom:'';
+  cont.innerHTML=`<div class="rp-titre">${egliseName?egliseName+' — ':''} RAPPORT MENSUEL</div>
+  <div class="rp-sub">${mLabel}</div>
+  ${buildRapportBlock(mLabel,E,S,te,ts,'mensuel')}`;
+}
+
+function buildRAnnee(year,cont){
+  const E=_cache.entrees.filter(e=>e.date.startsWith(year)&&hasAccess(e.caisse));
+  const S=_cache.sorties.filter(s=>s.date.startsWith(year)&&hasAccess(s.caisse));
+  const te=E.reduce((a,e)=>a+Number(e.montant),0);
+  const ts=S.reduce((a,s)=>a+Number(s.montant),0);
+  const egliseName=window._currentEglise?window._currentEglise.nom:'';
+  let html=`<div class="rp-titre">${egliseName?egliseName+' — ':''} RAPPORT ANNUEL</div>
+  <div class="rp-sub">${year}</div>
+  ${buildRapportBlock(year,E,S,te,ts,'annuel')}<div style="margin-top:28px">`;
+  MOIS.forEach((mNom,idx)=>{
+    const mp=year+'-'+String(idx+1).padStart(2,'0');
+    const Em=E.filter(e=>e.date.startsWith(mp));const Sm=S.filter(s=>s.date.startsWith(mp));
+    if(!Em.length&&!Sm.length)return;
+    const tem=Em.reduce((a,e)=>a+Number(e.montant),0);const tsm=Sm.reduce((a,s)=>a+Number(s.montant),0);
+    html+=`<div style="margin-bottom:24px"><div style="font-family:'Cinzel','Georgia',serif;font-size:12px;color:var(--gold);letter-spacing:2px;font-weight:700;padding:10px 16px;background:var(--bg4);border:2px solid var(--border2);border-radius:var(--r) var(--r) 0 0">📅 ${mNom.toUpperCase()} ${year}</div>
+    <div style="border:2px solid var(--border2);border-top:none;border-radius:0 0 var(--r) var(--r);padding:12px;background:#fff">${buildRapportBlock(mNom+' '+year,Em,Sm,tem,tsm,'mois-detail')}</div></div>`;
+  });
+  html+='</div>';
+  cont.innerHTML=html;
+}
+
+function buildRapportBlock(label,E,S,te,ts,type){
+  const caissesList=CAISSES.filter(c=>hasAccess(c.id));
+  const caisseData=caissesList.map(c=>{
+    const ce=E.filter(e=>e.caisse===c.id);const cs=S.filter(s=>s.caisse===c.id);
+    const cte=ce.reduce((a,e)=>a+Number(e.montant),0);const cts=cs.reduce((a,s)=>a+Number(s.montant),0);
+    return{c,ce,cs,cte,cts,solde:cte-cts,nbE:ce.length,nbS:cs.length};
+  });
+  const thCaisses=caisseData.map(d=>`<th style="border-left:1px solid var(--border2)">${d.c.icon}<br><span style="font-size:10px">${d.c.nom}</span></th>`).join('');
+  const rowEntrees=caisseData.map(d=>`<td style="color:var(--green);font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-size:14px;font-weight:700;border-left:1px solid var(--border)">+${fmt(d.cte)}</td>`).join('');
+  const rowSorties=caisseData.map(d=>`<td style="color:var(--red);font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-size:14px;font-weight:700;border-left:1px solid var(--border)">-${fmt(d.cts)}</td>`).join('');
+  const rowSoldes=caisseData.map(d=>`<td style="font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-size:15px;font-weight:700;color:${d.solde>=0?'var(--green)':'var(--red)'};border-left:1px solid var(--border)">${fmt(d.solde)}</td>`).join('');
+  const rowNb=caisseData.map(d=>`<td style="font-size:12px;color:var(--text3);border-left:1px solid var(--border)">${d.nbE+d.nbS}</td>`).join('');
+  const caisseTable=`<div style="margin-bottom:16px"><div class="rp-caisses-wrap"><table class="rp-caisses-table"><thead><tr><th class="row-hdr">Indicateur</th>${thCaisses}<th style="border-left:2px solid var(--border2);background:var(--gold3);color:var(--gold)">TOTAL</th></tr></thead><tbody>
+    <tr><td class="row-lbl">📥 Entrées</td>${rowEntrees}<td style="color:var(--green);font-weight:700;border-left:2px solid var(--border2);background:var(--green2)">+${fmt(te)}</td></tr>
+    <tr><td class="row-lbl">📤 Sorties</td>${rowSorties}<td style="color:var(--red);font-weight:700;border-left:2px solid var(--border2);background:var(--red2)">-${fmt(ts)}</td></tr>
+    <tr class="rp-solde"><td class="row-lbl">💰 Solde</td>${rowSoldes}<td style="font-size:15px;font-weight:700;color:${te-ts>=0?'var(--green)':'var(--red)'};border-left:2px solid var(--border2)">${fmt(te-ts)}</td></tr>
+    <tr><td class="row-lbl">📋 Transactions</td>${rowNb}<td style="font-size:13px;font-weight:700;color:var(--text3);border-left:2px solid var(--border2)">${E.length+S.length}</td></tr>
+  </tbody></table></div></div>`;
+
+  // Détail par caisse pour rapports mensuels/annuels
+  let detail='';
+  if(type==='mensuel'||type==='annuel'||type==='mois-detail'){
+    caisseData.forEach(d=>{
+      if(!d.ce.length&&!d.cs.length)return;
+      const maxR=Math.max(d.ce.length,d.cs.length,1);
+      let rows='';
+      for(let i=0;i<maxR;i++){
+        const e=d.ce[i]||null;const s=d.cs[i]||null;
+        rows+=`<tr style="border-top:1px solid var(--border);background:${i%2===0?'#fff':'var(--bg3)'}">
+          <td style="text-align:right;font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-size:13px;font-weight:700;color:var(--green);padding:7px 10px">${e?'+'+fmt(e.montant):''}</td>
+          <td style="font-size:11px;color:var(--text2);padding:7px 10px">${e?dFR(e.date):''}</td>
+          <td style="text-align:right;font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-size:13px;font-weight:700;color:var(--red);padding:7px 10px;border-left:1px solid var(--border)">${s?'-'+fmt(s.montant):''}</td>
+          <td style="font-size:11px;color:var(--text2);padding:7px 10px">${s?dFR(s.date):''}</td>
+          <td style="font-size:12px;font-weight:700;padding:7px 10px;border-left:1px solid var(--border)">${s?(s.destTitre?s.destTitre+' ':'')+s.destinataire:'—'}</td>
+          <td style="font-size:11px;color:var(--text2);padding:7px 10px">${s?s.motif||'—':e?e.commentaire||'—':'—'}</td>
+        </tr>`;
+      }
+      const nbVides=Math.max(3,5-maxR);
+      for(let i=0;i<nbVides;i++)rows+=`<tr style="border-top:1px dashed var(--border);height:28px;background:var(--bg)"><td colspan="6" style="padding:0"></td></tr>`;
+      const totE=d.cte;const totS=d.cts;
+      rows+=`<tr class="rp-total"><td colspan="2" style="text-align:right;color:var(--green);font-weight:700;padding:8px 10px">Total : +${fmt(totE)}</td><td colspan="2" style="text-align:right;color:var(--red);font-weight:700;padding:8px 10px;border-left:1px solid var(--border)">Total : -${fmt(totS)}</td><td colspan="2" style="font-weight:700;color:${d.solde>=0?'var(--green)':'var(--red)'};padding:8px 10px;border-left:1px solid var(--border)">Solde : ${fmt(d.solde)}</td></tr>`;
+      detail+=`<div style="margin-bottom:16px;margin-top:16px">
+        <div style="font-family:'Cinzel','Georgia',serif;font-size:11px;color:var(--gold);letter-spacing:1.5px;font-weight:700;padding:8px 14px;background:var(--bg4);border:1px solid var(--border2);border-radius:var(--r) var(--r) 0 0">${d.c.icon} ${d.c.nom.toUpperCase()}</div>
+        <div class="rp-twrap" style="border-top:none;border-radius:0 0 var(--r) var(--r)"><table class="rp-table"><thead><tr><th style="color:var(--green)">Entrée</th><th>Date</th><th style="color:var(--red);border-left:1px solid var(--border)">Sortie</th><th>Date</th><th style="border-left:1px solid var(--border)">Destinataire/Donateur</th><th>Motif</th></tr></thead><tbody>${rows}</tbody></table></div>
+      </div>`;
+    });
+  }
+
+  // Détail liste des bénéficiaires
+  const benefs=[...new Set(S.map(s=>s.destinataire).filter(Boolean))];
+  let benefTable='';
+  if(benefs.length){
+    const rows=benefs.map(nom=>{
+      const ss=S.filter(s=>s.destinataire===nom);
+      const total=ss.reduce((a,s)=>a+Number(s.montant),0);
+      return`<tr><td style="font-weight:700">${nom}</td><td>${ss.length}</td><td style="font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-size:14px;font-weight:700;color:var(--red)">-${fmt(total)}</td><td style="font-size:11px;color:var(--text3)">${[...new Set(ss.map(s=>getCaisse(s.caisse).nom))].join(', ')}</td></tr>`;
+    }).join('');
+    benefTable=`<div style="margin-top:20px"><div style="font-family:'Cinzel','Georgia',serif;font-size:11px;color:var(--gold);letter-spacing:1.5px;font-weight:700;padding:8px 14px;background:var(--bg4);border:2px solid var(--border2);border-radius:var(--r) var(--r) 0 0">👥 BÉNÉFICIAIRES</div>
+    <div class="rp-benef-wrap" style="border:1px solid var(--border);border-top:none;border-radius:0 0 var(--r) var(--r)"><table class="rp-benef-table"><thead><tr><th>Nom</th><th>Nb aides</th><th>Total reçu</th><th>Caisses</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+  }
+
+  return caisseTable+detail+benefTable;
+}
+
+function telechargerPDF(){
+  if(typeof html2pdf==='undefined'){toast('Bibliothèque PDF non disponible','err');return;}
+  const el=document.getElementById('rapportContent');
+  const opt={margin:10,filename:'rapport-church-ledger-'+new Date().toISOString().split('T')[0]+'.pdf',image:{type:'jpeg',quality:0.95},html2canvas:{scale:2},jsPDF:{unit:'mm',format:'a4',orientation:'portrait'}};
+  html2pdf().set(opt).from(el).save();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTES
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function saveNote(){
+  const cat=document.getElementById('noteCat').value;
+  const text=document.getElementById('noteText').value.trim();
+  if(!text){toast('Saisissez une note','warn');return;}
+  const now=new Date();
+  const item={id:uid(),date:now.toISOString().split('T')[0],heure:now.toTimeString().slice(0,5),categorie:cat,texte:text,par:currentUser.nom};
+  _cache.notes.push(item);
+  await addToFS('notes',item);
+  document.getElementById('noteText').value='';
+  renderNotes();toast('Note enregistrée ✓','ok');
+}
+
+function renderNotes(){
+  const list=document.getElementById('notesList');
+  const N=[..._cache.notes].sort((a,b)=>b.date.localeCompare(a.date));
+  if(!N.length){list.innerHTML='<div class="empty"><div class="ei">📝</div><p>Aucune note</p></div>';return;}
+  list.innerHTML=N.map(n=>`<div class="ncard">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:6px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="bdg am">${n.categorie||'général'}</span>
+        <span style="font-size:11px;color:var(--text3)">${dFR(n.date)} ${n.heure||''}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;color:var(--text3)">par ${n.par||'—'}</span>
+        <button class="btn dan sm no-print" onclick="delNote('${n.id}')">🗑</button>
+      </div>
+    </div>
+    <p style="font-size:13px;color:var(--text);line-height:1.6">${n.texte}</p>
+  </div>`).join('');
+}
+
+async function delNote(id){
+  if(!confirm('Supprimer cette note ?'))return;
+  _cache.notes=_cache.notes.filter(n=>n.id!==id);
+  await delFromFS('notes',id);
+  renderNotes();toast('Note supprimée','warn');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MEMBRES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function renderMembres(){
+  const list=document.getElementById('membresList');
+  if(!list)return;
+  list.innerHTML=_cache.members.map(m=>`<div class="mrow">
+    <div class="mavt">${m.nom.charAt(0).toUpperCase()}</div>
+    <div>
+      <div style="font-weight:700;font-size:14px">${m.nom}</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:2px">${m.contact||'—'}</div>
+    </div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+      <span class="bdg ${m.role==='admin'?'gold':'b'}">${m.role==='admin'?'Admin':'Membre'}</span>
+      <span class="bdg ${m.statut==='bloque'?'r':'g'}">${m.statut==='bloque'?'Bloqué':'Actif'}</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px" class="no-print">
+      <button class="btn sec sm" onclick="editMembre('${m.id}')">✏️</button>
+      ${m.id!==currentUser.id?`<button class="btn dan sm" onclick="delMembre('${m.id}')">🗑</button>`:''}
+    </div>
+  </div>`).join('');
+}
+
+function resetMembreForm(){
+  document.getElementById('mNom').value='';
+  document.getElementById('mContact').value='';
+  document.getElementById('mRole').value='membre';
+  document.getElementById('mPin').value='';
+  document.getElementById('mStatut').value='actif';
+  populateSelects();
+  document.querySelectorAll('#mCaissesCheck input[type=checkbox]').forEach(cb=>cb.checked=false);
+}
+
+function editMembre(id){
+  const m=_cache.members.find(x=>x.id===id);if(!m)return;
+  editMembreId=id;
+  document.getElementById('mMembreTitle').textContent='MODIFIER MEMBRE';
+  document.getElementById('mNom').value=m.nom;
+  document.getElementById('mContact').value=m.contact||'';
+  document.getElementById('mRole').value=m.role;
+  document.getElementById('mPin').value=m.pin;
+  document.getElementById('mStatut').value=m.statut||'actif';
+  populateSelects();
+  document.querySelectorAll('#mCaissesCheck input[type=checkbox]').forEach(cb=>{cb.checked=(m.caisses||[]).includes(cb.value);});
+  openModal('mMembre');
+}
+
+async function saveMembre(){
+  const nom=document.getElementById('mNom').value.trim();
+  const contact=document.getElementById('mContact').value.trim();
+  const role=document.getElementById('mRole').value;
+  const pin=document.getElementById('mPin').value.trim();
+  const statut=document.getElementById('mStatut').value;
+  if(!nom||!pin){toast('Nom et PIN obligatoires','err');return;}
+  const caisses=Array.from(document.querySelectorAll('#mCaissesCheck input[type=checkbox]:checked')).map(cb=>cb.value);
+  if(editMembreId){
+    const m=_cache.members.find(x=>x.id===editMembreId);
+    if(m){Object.assign(m,{nom,contact,role,pin,statut,caisses});await updateInFS('members',m.id,m);}
+  } else {
+    const m={id:uid(),nom,contact,role,pin,statut,caisses};
+    _cache.members.push(m);await addToFS('members',m);
+  }
+  closeModal('mMembre');editMembreId=null;renderMembres();toast('Membre enregistré ✓','ok');buildLoginSelect();
+}
+
+async function delMembre(id){
+  if(id===currentUser.id){toast('Vous ne pouvez pas supprimer votre propre compte','err');return;}
+  if(!confirm('Supprimer ce membre ?'))return;
+  _cache.members=_cache.members.filter(m=>m.id!==id);
+  await delFromFS('members',id);
+  renderMembres();toast('Membre supprimé','warn');buildLoginSelect();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROFIL
+// ═══════════════════════════════════════════════════════════════════════════
+
+function openProfil(){
+  if(!currentUser)return;
+  document.getElementById('pNom').value=currentUser.nom;
+  document.getElementById('pContact').value=currentUser.contact||'';
+  document.getElementById('pPinActuel').value='';
+  document.getElementById('pPinNouv').value='';
+  document.getElementById('pPinConf').value='';
+  document.getElementById('mProfilAlert').innerHTML='';
+  openModal('mProfil');
+}
+
+async function saveProfil(){
+  const nom=document.getElementById('pNom').value.trim();
+  const contact=document.getElementById('pContact').value.trim();
+  const pinActuel=document.getElementById('pPinActuel').value;
+  const pinNouv=document.getElementById('pPinNouv').value;
+  const pinConf=document.getElementById('pPinConf').value;
+  const alertEl=document.getElementById('mProfilAlert');
+  if(!nom){alertEl.innerHTML=`<div class="al err">❌ Nom obligatoire.</div>`;return;}
+  if(!pinActuel){alertEl.innerHTML=`<div class="al err">❌ Saisissez votre PIN actuel pour confirmer.</div>`;return;}
+  const idx=_cache.members.findIndex(m=>m.id===currentUser.id);
+  if(idx<0){alertEl.innerHTML=`<div class="al err">❌ Membre introuvable.</div>`;return;}
+  if(_cache.members[idx].pin!==pinActuel){alertEl.innerHTML=`<div class="al err">❌ PIN actuel incorrect.</div>`;return;}
+  if(pinNouv){
+    if(pinNouv.length<4){alertEl.innerHTML=`<div class="al err">❌ Le nouveau PIN doit comporter au moins 4 chiffres.</div>`;return;}
+    if(pinNouv!==pinConf){alertEl.innerHTML=`<div class="al err">❌ La confirmation du nouveau PIN ne correspond pas.</div>`;return;}
+    _cache.members[idx].pin=pinNouv;
+  }
+  _cache.members[idx].nom=nom;_cache.members[idx].contact=contact;
+  await updateInFS('members',currentUser.id,_cache.members[idx]);
+  currentUser={...currentUser,nom,contact};
+  if(pinNouv)currentUser.pin=pinNouv;
+  document.getElementById('tbAvt').textContent=nom.charAt(0).toUpperCase();
+  document.getElementById('tbNom').textContent=nom;
+  closeModal('mProfil');toast('✅ Profil mis à jour','ok');renderMembres();buildLoginSelect();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PARAMÈTRES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function initParams(){
+  const isAdmin=currentUser&&currentUser.role==='admin';
+  document.getElementById('paramsAdminOnly').style.display=isAdmin?'':'none';
+  document.getElementById('paramsNoAdmin').style.display=isAdmin?'none':'';
+}
+
+async function resetEntrees(){
+  if(!confirm('Effacer TOUTES les entrées ? Cette action est irréversible.'))return;
+  _cache.entrees=[];await syncFS('entrees',[]);
+  toast('Toutes les entrées ont été effacées','warn');buildDashboard();
+}
+
+async function resetSorties(){
+  if(!confirm('Effacer TOUTES les sorties ? Cette action est irréversible.'))return;
+  _cache.sorties=[];await syncFS('sorties',[]);
+  toast('Toutes les sorties ont été effacées','warn');buildDashboard();
+}
+
+async function resetNotes(){
+  if(!confirm('Effacer toutes les notes ?'))return;
+  _cache.notes=[];await syncFS('notes',[]);
+  toast('Notes effacées','warn');
+}
+
+async function resetTotal(){
+  if(!confirm('⚠️ RÉINITIALISATION COMPLÈTE\n\nCela effacera TOUTES les entrées, sorties et notes.\nLes membres seront conservés.\n\nContinuer ?'))return;
+  if(!confirm('Dernière confirmation — Cette action est définitivement irréversible. Continuer ?'))return;
+  _cache.entrees=[];_cache.sorties=[];_cache.notes=[];
+  await Promise.all([syncFS('entrees',[]),syncFS('sorties',[]),syncFS('notes',[])]);
+  toast('Réinitialisation complète effectuée','warn');buildDashboard();
+}
+
+function exportJSON(){
+  const data={eglise:window._currentEglise||{},entrees:_cache.entrees,sorties:_cache.sorties,notes:_cache.notes,membres:_cache.members,date:new Date().toISOString()};
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='church-ledger-'+(window._currentEglise?.nom||'backup')+'-'+new Date().toISOString().split('T')[0]+'.json';
+  a.click();toast('Sauvegarde téléchargée ✓','ok');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INITIALISATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// PWA — Service Worker uniquement sur vrai hébergement (pas en local)
+let deferredPrompt=null;
+window.addEventListener('beforeinstallprompt',(e)=>{
+  e.preventDefault();deferredPrompt=e;
+  if(!localStorage.getItem('pwa-installed'))showInstallBanner(deferredPrompt);
+});
+window.addEventListener('appinstalled',()=>{localStorage.setItem('pwa-installed','1');hideInstallBanner();});
+
+if('serviceWorker' in navigator && location.protocol !== 'blob:' && !location.href.startsWith('blob:') && location.hostname !== 'localhost' && location.protocol !== 'file:' && !location.href.includes('claudeusercontent.com')){
+  navigator.serviceWorker.register('sw.js')
+    .then(r=>console.log('✅ SW actif',r.scope))
+    .catch(e=>console.warn('SW non disponible (hors ligne OK via IDB):',e.message));
+}
+
+function showInstallBanner(prompt){
+  const banner=document.createElement('div');banner.id='install-banner';
+  banner.style.cssText='position:fixed;bottom:0;left:0;right:0;background:#b8941f;color:#fff;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;z-index:99999;font-family:sans-serif;font-size:13px;box-shadow:0 -4px 20px rgba(0,0,0,0.2);gap:12px;flex-wrap:wrap';
+  banner.innerHTML='<span>📲 <strong>Installer Church Ledger</strong> — Fonctionne hors ligne</span><div style="display:flex;gap:8px"><button onclick="doInstall()" style="background:#fff;color:#b8941f;border:none;padding:8px 18px;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px">Installer</button><button onclick="hideInstallBanner()" style="background:rgba(255,255,255,0.2);color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px">Plus tard</button></div>';
+  document.body.appendChild(banner);window._deferredPrompt=prompt;
+}
+function doInstall(){if(window._deferredPrompt){window._deferredPrompt.prompt();window._deferredPrompt.userChoice.then(r=>{if(r.outcome==='accepted')localStorage.setItem('pwa-installed','1');hideInstallBanner();});}}
+function hideInstallBanner(){const b=document.getElementById('install-banner');if(b)b.remove();}
+
+// Tentative de restauration de session au démarrage
+(async function init(){
+  window.CAISSES_IDS=CAISSES.map(c=>c.id);
+  const savedEgliseId=localStorage.getItem('cl_eglise_id');
+  if(savedEgliseId){
+    window._currentEgliseId=savedEgliseId;
+    try {
+      const eglise=await window.getEglise(savedEgliseId);
+      if(eglise&&eglise.statut==='actif'){
+        window._currentEglise=eglise;
+        await window.loadFirestoreData(savedEgliseId);
+        afficherLoginMembres(eglise);
+        return;
+      }
+    } catch(e){ console.warn('Init session err:',e); }
+    localStorage.removeItem('cl_eglise_id');
+    localStorage.removeItem('cl_session_id');
+  }
+  // Pas de session sauvegardée → charger l'écran d'accueil et les églises en arrière-plan
+  document.getElementById('welcomeScreen').style.display='flex';
+  wGoStep('wStep1');
+})();
+</script>
+</body>
+</html>
